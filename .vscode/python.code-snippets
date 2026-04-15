@@ -1,0 +1,22 @@
+{
+  "Python Module Header": {
+    "scope": "python",
+    "prefix": "pyheader",
+    "description": "Insert the shared Python module header used by this repository.",
+    "body": [
+      "#!/usr/bin/env python3",
+      "# -*- coding: utf-8 -*-",
+      "# @Time    : $CURRENT_YEAR-$CURRENT_MONTH-$CURRENT_DATE",
+      "# @Author  : Zhaoze Wang",
+      "# @Site    : https://github.com/Wangzhaoze/generative_models_lightning",
+      "# @File    : ${RELATIVE_FILEPATH}",
+      "# @IDE     : vscode",
+      "",
+      "\"\"\"",
+      "${1:Describe the purpose of this module.}",
+      "\"\"\"",
+      "",
+      "$0"
+    ]
+  }
+}
