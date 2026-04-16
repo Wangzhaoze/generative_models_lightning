@@ -12,13 +12,12 @@
 </p>
   
 <div align=center>
-    <img src="https://img.shields.io/badge/Python-3.12.3-3776AB.svg?style=for-the-badge&logo=python" alt="python">
+    <img src="https://img.shields.io/badge/Python-3.10.16-3776AB.svg?style=for-the-badge&logo=python" alt="python">
     <img src=https://img.shields.io/badge/PyTorch-2.8.0-EE4C2C.svg?style=for-the-badge&logo=pytorch>
     <img src=https://img.shields.io/badge/Lightning-2.5.0-purple?style=for-the-badge&logo=lightning>
 </div>
 
 <div align=center>
-    <img src="https://img.shields.io/badge/UV-gray?style=for-the-badge&logo=uv&logoColor=white&labelColor=DE5FE9" alt="UV">
     <img src="https://img.shields.io/badge/Docker-gray?style=for-the-badge&logo=docker&logoColor=white&labelColor=%23007FFF" alt="Docker">
     <img src="https://img.shields.io/badge/Wandb-gray?style=for-the-badge&logo=weightsandbiases" alt="wandb">
 </div>
