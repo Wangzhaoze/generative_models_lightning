@@ -20,3 +20,13 @@ env/
 .idea/
 .DS_Store
 
+# Data pre processing
+data_module/ColoRadar/Coloradar_pre_processing/
+demo.py
+demo2.py
+
+checkpoints/
+checkpoints/flow/lightning_logs/version_0/hparams.yaml
+
+result.gif
+sample.py
