@@ -3,7 +3,7 @@
 # @Time    : 2026-04-07
 # @Author  : Zhaoze Wang
 # @Site    : https://github.com/Wangzhaoze/generative_models_lightning
-# @File    : generative_models_lightning/diffusion/__init__.py
+# @File    : generative_models_lightning/diffusion/base_diffusion_module.py
 # @IDE     : vscode
 
 """
@@ -18,10 +18,9 @@ import torch
 from generative_models_lightning import BaseGenerativeModule, Batch
 import torch.nn as nn
 
-from generative_models_lightning.diffusion.process.gaussian_diffusion import GaussianDiffusion, mean_flat, DiffusionLossType, DiffusionMeanType, DiffusionVarType
+from .gaussian_diffusion import GaussianDiffusion, mean_flat, DiffusionLossType, DiffusionMeanType, DiffusionVarType
 
-
-class BaseDiffusionModule(BaseGenerativeModule):
+class BaseDiffusionLitModule(BaseGenerativeModule):
     """
     Shared LightningModule scaffolding for diffusion models.
 
@@ -32,15 +31,15 @@ class BaseDiffusionModule(BaseGenerativeModule):
 
     def __init__(
         self,
-        diffusion_process: GaussianDiffusion,
         denoiser: nn.Module,
+        scheduler: GaussianDiffusion,
         mean_type: DiffusionMeanType,
         var_type: DiffusionVarType,
         loss_type: DiffusionLossType,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.diffusion_process = diffusion_process
+        self.scheduler = scheduler
         self.denoiser = denoiser
         self.mean_type = mean_type
         self.var_type = var_type
@@ -49,7 +48,7 @@ class BaseDiffusionModule(BaseGenerativeModule):
     def training_step(self, batch: Batch, batch_idx: int):
         t=torch.randint(
             low=0, 
-            high=self.diffusion_process.num_timesteps, 
+            high=self.scheduler.num_timesteps, 
             size=(batch["x"].shape[0],), 
             device=batch["x"].device
             )
@@ -83,7 +82,7 @@ class BaseDiffusionModule(BaseGenerativeModule):
     def validation_step(self, batch: Batch, batch_idx: int):
         t=torch.randint(
             low=0, 
-            high=self.diffusion_process.num_timesteps, 
+            high=self.scheduler.num_timesteps, 
             size=(batch["x"].shape[0],), 
             device=batch["x"].device
             )
@@ -117,7 +116,7 @@ class BaseDiffusionModule(BaseGenerativeModule):
     
     def generate(self, batch: Batch, *args, **kwargs):
         with torch.no_grad():
-            generated = self.diffusion_process.p_sample_loop(
+            generated = self.scheduler.p_sample_loop(
                 self.denoiser,
                 batch["x"],
                 device=self.device,
@@ -145,15 +144,15 @@ class BaseDiffusionModule(BaseGenerativeModule):
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
-        kwargs = self.diffusion_process._normalize_model_kwargs(model_kwargs)
+        kwargs = self.scheduler._normalize_model_kwargs(model_kwargs)
         if noise is None:
             noise = torch.randn_like(x_start)
-        x_t = self.diffusion_process.q_sample(x_start, t, noise=noise)
+        x_t = self.scheduler.q_sample(x_start, t, noise=noise)
 
         terms = {}
 
         if self.loss_type == DiffusionLossType.KL or self.loss_type == DiffusionLossType.RESCALED_KL:
-            terms["loss"] = self.diffusion_process._vb_terms_bpd(
+            terms["loss"] = self.scheduler._vb_terms_bpd(
                 denoiser=self.denoiser,
                 x_start=x_start,
                 x_t=x_t,
@@ -162,19 +161,19 @@ class BaseDiffusionModule(BaseGenerativeModule):
                 model_kwargs=kwargs,
             )["output"]
             if self.loss_type == DiffusionLossType.RESCALED_KL:
-                terms["loss"] *= self.diffusion_process.num_timesteps
+                terms["loss"] *= self.scheduler.num_timesteps
         elif self.loss_type == DiffusionLossType.MSE or self.loss_type == DiffusionLossType.RESCALED_MSE:
             y = cast(Optional[torch.Tensor], kwargs.get("y"))
             if y is not None:
                 model_output = self.denoiser(
                     x_t,
-                    self.diffusion_process._scale_timesteps(t),
+                    self.scheduler._scale_timesteps(t),
                     y=y,
                 )
             else:
                 model_output = self.denoiser(
                     x_t,
-                    self.diffusion_process._scale_timesteps(t),
+                    self.scheduler._scale_timesteps(t),
                     **kwargs,
                 )
 
@@ -188,7 +187,7 @@ class BaseDiffusionModule(BaseGenerativeModule):
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
                 frozen_out = torch.cat([model_output.detach(), model_var_values], dim=1)
-                terms["vb"] = self.diffusion_process._vb_terms_bpd(
+                terms["vb"] = self.scheduler._vb_terms_bpd(
                     denoiser=lambda *args, r=frozen_out: r,
                     x_start=x_start,
                     x_t=x_t,
@@ -198,10 +197,10 @@ class BaseDiffusionModule(BaseGenerativeModule):
                 if self.loss_type == DiffusionLossType.RESCALED_MSE:
                     # Divide by 1000 for equivalence with initial implementation.
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
-                    terms["vb"] *= self.diffusion_process.num_timesteps / 1000.0
+                    terms["vb"] *= self.scheduler.num_timesteps / 1000.0
 
             target = {
-                DiffusionMeanType.PREVIOUS_X: self.diffusion_process.q_posterior_mean_variance(
+                DiffusionMeanType.PREVIOUS_X: self.scheduler.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t
                 )[0],
                 DiffusionMeanType.START_X: x_start,

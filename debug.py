@@ -2,11 +2,12 @@
 import torch
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
-from generative_models_lightning.diffusion.base_diffusion_module import BaseDiffusionModule
+from generative_models_lightning.diffusion.base_diffusion_module import BaseDiffusionLitModule
 from lightning.pytorch.loggers import TensorBoardLogger
 from generative_models_lightning.backbones.cond_unet import UNetModel
-from generative_models_lightning.diffusion import SpacedDiffusion, space_timesteps, DiffusionLossType, DiffusionMeanType, DiffusionVarType, get_named_beta_schedule
-
+from generative_models_lightning.diffusion import SpacedDiffusion, space_timesteps
+from generative_models_lightning.diffusion.utils import DiffusionMeanType, DiffusionVarType, DiffusionLossType
+from generative_models_lightning.diffusion.beta_schedule import LinearBetaSchedule
 from data_module.rodnet2021 import BaseDataModule, ConfMapConfig
 from data_module.rodnet2021.rodnet2021_dataset import RODNet2021Dataset
 
@@ -18,7 +19,7 @@ if __name__ == "__main__":
 
     torch.set_float32_matmul_precision("medium")  # (optional, to use Tensor Cores properly)
 
-    module = BaseDiffusionModule(
+    module = BaseDiffusionLitModule(
         denoiser = UNetModel(
             image_size=128,
             in_channels=8,
@@ -38,9 +39,10 @@ if __name__ == "__main__":
             resblock_updown=True,
             use_new_attention_order=False,
         ),
-        diffusion_process=SpacedDiffusion(
-            use_timesteps=space_timesteps(1000, "1000"), 
-            betas=get_named_beta_schedule("linear", 1000),
+        scheduler=SpacedDiffusion(
+            num_timesteps=1000,
+            section_counts="1000",
+            betas=LinearBetaSchedule(num_timesteps=1000),
             model_mean_type=DiffusionMeanType.EPSILON,
             model_var_type=DiffusionVarType.FIXED_LARGE,
             loss_type=DiffusionLossType.MSE,

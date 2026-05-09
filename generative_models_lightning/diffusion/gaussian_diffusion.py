@@ -11,50 +11,21 @@ Implementation adapted from:
 https://github.com/openai/guided-diffusion/blob/main/guided_diffusion/gaussian_diffusion.py
 """
 
-import enum
-import math
 from typing import Any, Mapping, Optional, cast
 
 import numpy as np
 import torch
 
-from generative_models_lightning.diffusion.process.utils import _extract_into_tensor, normal_kl, mean_flat, approx_standard_normal_cdf
-
-
-class DiffusionMeanType(enum.Enum):
-    """
-    Which type of output the denoiser predicts.
-    """
-
-    PREVIOUS_X = enum.auto()  # the denoiser predicts x_{t-1}
-    START_X = enum.auto()  # the denoiser predicts x_0
-    EPSILON = enum.auto()  # the denoiser predicts epsilon
-
-
-class DiffusionVarType(enum.Enum):
-    """
-    What is used as the denoiser's output variance.
-
-    The LEARNED_RANGE option has been added to allow the denoiser to predict
-    values between FIXED_SMALL and FIXED_LARGE, making its job easier.
-    """
-
-    LEARNED = enum.auto()
-    FIXED_SMALL = enum.auto()
-    FIXED_LARGE = enum.auto()
-    LEARNED_RANGE = enum.auto()
-
-
-class DiffusionLossType(enum.Enum):
-    MSE = enum.auto()  # use raw MSE loss (and KL when learning variances)
-    RESCALED_MSE = (
-        enum.auto()
-    )  # use raw MSE loss (with RESCALED_KL when learning variances)
-    KL = enum.auto()  # use the variational lower-bound
-    RESCALED_KL = enum.auto()  # like KL, but rescale to estimate the full VLB
-
-    def is_vb(self):
-        return self == DiffusionLossType.KL or self == DiffusionLossType.RESCALED_KL
+from beta_schedule import BetaSchedule
+from .utils import (
+    extract_into_tensor, 
+    mean_flat, 
+    normal_kl, 
+    approx_standard_normal_cdf,
+    DiffusionLossType,
+    DiffusionMeanType,
+    DiffusionVarType,
+    )
     
 class GaussianDiffusion:
     """
@@ -76,18 +47,18 @@ class GaussianDiffusion:
     def __init__(
         self,
         *,
-        betas,
-        model_mean_type,
-        model_var_type,
-        loss_type,
-        rescale_timesteps=False,
+        betas: BetaSchedule,
+        model_mean_type: DiffusionMeanType,
+        model_var_type: DiffusionVarType,
+        loss_type: DiffusionLossType,
+        rescale_timesteps: bool = False,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
 
-        betas = np.array(betas, dtype=np.float64)
+        betas = np.asarray(betas, dtype=np.float64)
         self.betas = betas
 
         alphas = 1.0 - betas
@@ -137,10 +108,10 @@ class GaussianDiffusion:
         :return: A tuple (mean, variance, log_variance), all of x_start's shape.
         """
         mean = (
-            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
         )
-        variance = _extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
-        log_variance = _extract_into_tensor(
+        variance = extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
+        log_variance = extract_into_tensor(
             self.log_one_minus_alphas_cumprod, t, x_start.shape
         )
         return mean, variance, log_variance
@@ -160,8 +131,8 @@ class GaussianDiffusion:
             noise = torch.randn_like(x_start)
         assert noise.shape == x_start.shape
         return (
-            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
             * noise
         )
 
@@ -174,11 +145,11 @@ class GaussianDiffusion:
         """
         assert x_start.shape == x_t.shape
         posterior_mean = (
-            _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
+            extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
         )
-        posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = _extract_into_tensor(
+        posterior_variance = extract_into_tensor(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract_into_tensor(
             self.posterior_log_variance_clipped, t, x_t.shape
         )
         assert (
@@ -246,10 +217,10 @@ class GaussianDiffusion:
                 pred_log_variance = model_var_values
                 pred_variance = torch.exp(pred_log_variance)
             else:
-                min_log = _extract_into_tensor(
+                min_log = extract_into_tensor(
                     self.posterior_log_variance_clipped, t, x.shape
                 )
-                max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+                max_log = extract_into_tensor(np.log(self.betas), t, x.shape)
                 # The model_var_values is [-1, 1] for [min_var, max_var].
                 frac = (model_var_values + 1) / 2
                 pred_log_variance = frac * max_log + (1 - frac) * min_log
@@ -267,8 +238,8 @@ class GaussianDiffusion:
                     self.posterior_log_variance_clipped,
                 ),
             }[self.model_var_type]
-            pred_variance = _extract_into_tensor(pred_variance, t, x.shape)
-            pred_log_variance = _extract_into_tensor(pred_log_variance, t, x.shape)
+            pred_variance = extract_into_tensor(pred_variance, t, x.shape)
+            pred_log_variance = extract_into_tensor(pred_log_variance, t, x.shape)
 
         def process_xstart(x):
             if denoised_fn is not None:
@@ -313,15 +284,15 @@ class GaussianDiffusion:
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
         return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
+            extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
         )
 
     def _predict_xstart_from_xprev(self, x_t, t, xprev):
         assert x_t.shape == xprev.shape
         return (  # (xprev - coef2*x_t) / coef1
-            _extract_into_tensor(1.0 / self.posterior_mean_coef1, t, x_t.shape) * xprev
-            - _extract_into_tensor(
+            extract_into_tensor(1.0 / self.posterior_mean_coef1, t, x_t.shape) * xprev
+            - extract_into_tensor(
                 self.posterior_mean_coef2 / self.posterior_mean_coef1, t, x_t.shape
             )
             * x_t
@@ -329,9 +300,9 @@ class GaussianDiffusion:
 
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
         return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - pred_xstart
-        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        ) / extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
 
     def condition_mean(
         self,
@@ -369,7 +340,7 @@ class GaussianDiffusion:
         from Song et al (2020).
         """
         kwargs = self._normalize_model_kwargs(model_kwargs)
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar = extract_into_tensor(self.alphas_cumprod, t, x.shape)
 
         eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
         eps = eps - (1 - alpha_bar).sqrt() * cond_fn(
@@ -562,8 +533,8 @@ class GaussianDiffusion:
         # in case we used x_start or x_prev prediction.
         eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
 
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
-        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+        alpha_bar = extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
         sigma = (
             eta
             * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
@@ -606,10 +577,10 @@ class GaussianDiffusion:
         # Usually our model outputs epsilon, but we re-derive it
         # in case we used x_start or x_prev prediction.
         eps = (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x.shape) * x
+            extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x.shape) * x
             - out["pred_xstart"]
-        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x.shape)
-        alpha_bar_next = _extract_into_tensor(self.alphas_cumprod_next, t, x.shape)
+        ) / extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x.shape)
+        alpha_bar_next = extract_into_tensor(self.alphas_cumprod_next, t, x.shape)
 
         # Equation 12. reversed
         mean_pred = (
