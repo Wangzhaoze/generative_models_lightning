@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# @Time    : 2026-04-07
-# @Author  : Zhaoze Wang
-# @Site    : https://github.com/Wangzhaoze/generative_models_lightning
-# @File    : data_module/RaDelft/dataset.py
-# @IDE     : vscode
 
-"""
-Dataset placeholder for the RaDelft dataset.
-"""
+"""RaDEFT interface placeholder for future raw radar-LiDAR support."""
+
+from data_module.ColoRadar.dataset import BaseMultiSensorDataset
 
 
-class RaDelftDataset:
-    """Minimal dataset placeholder for RaDelft."""
+class RaDelftDataset(BaseMultiSensorDataset):
+    """Placeholder dataset adapter.
 
-    def __len__(self) -> int:
-        return 0
+    TODO: Implement RaDEFT raw file indexing, loading, calibration, and sync
+    using the same BaseMultiSensorDataset + MultiSensorPipeline interface.
+    """
+
+    def build_index(self):
+        raise NotImplementedError("RaDEFT support is not part of the first MVP.")
+
+    def load_raw(self, meta):
+        _ = meta
+        raise NotImplementedError("RaDEFT support is not part of the first MVP.")

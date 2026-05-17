@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# @Time    : 2026-04-07
-# @Author  : Zhaoze Wang
-# @Site    : https://github.com/Wangzhaoze/generative_models_lightning
-# @File    : data_module/RaDelft/datamodule.py
-# @IDE     : vscode
 
-"""
-PyTorch Lightning datamodule placeholder for the RaDelft dataset.
-"""
+"""RaDEFT datamodule placeholder."""
 
 
 class RaDelftDataModule:
-    """Minimal datamodule placeholder for RaDelft."""
+    """Keeps the extension point explicit without implementing it yet."""
+
+    def __init__(self, cfg=None):
+        self.cfg = cfg
 
     def setup(self, stage: str | None = None) -> None:
         _ = stage
+        raise NotImplementedError("RaDEFT is intentionally not implemented in this MVP.")

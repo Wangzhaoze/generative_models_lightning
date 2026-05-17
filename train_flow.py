@@ -48,7 +48,7 @@ class FlowMatchingModel(BaseGenerativeModule):
         sigma: float = 0.0,
         num_classes: int = 19,
         in_channels: int = 3,
-        image_size: int = 64,
+        image_shape: Union[int, tuple[int, int]] = 64,
         drop_rate: float = 0.1,
         lr: float = 1e-4,
         weight_decay: float = 0.0,
@@ -58,12 +58,10 @@ class FlowMatchingModel(BaseGenerativeModule):
     ):
         super().__init__()
         self.model = model
-        # CosineScheduler: alpha_t=sin(π/2·t), sigma_t=cos(π/2·t)
-        # Smoother path than linear CondOT; preserves more mid-frequency face details
         self.fm = AffineProbPath(CosineScheduler())
         self.num_classes = num_classes
         self.in_channels = in_channels
-        self.image_size = image_size
+        self.image_shape = (image_shape, image_shape) if isinstance(image_shape, int) else tuple(image_shape)
         self.drop_rate = drop_rate
         self.lr = lr
         self.weight_decay = weight_decay
@@ -105,7 +103,7 @@ class FlowMatchingModel(BaseGenerativeModule):
         vt = vt[:, :self.in_channels]
 
         loss = F.mse_loss(vt, ut)
-        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch: tuple[torch.Tensor, dict], _batch_idx: int):
@@ -124,7 +122,7 @@ class FlowMatchingModel(BaseGenerativeModule):
         vt = vt[:, :self.in_channels]
 
         loss = F.mse_loss(vt, ut)
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
@@ -151,10 +149,12 @@ class FlowMatchingModel(BaseGenerativeModule):
         }
 
     @torch.no_grad()
-    def generate(self, cond=None, batch_size=4, num_steps=100, **kwargs):
+    def generate(self, cond=None, batch_size=4, num_steps=100, sample_steps=None, **kwargs):
         """ODESolver: integrate velocity field from t=0 (noise) to t=1 (data)."""
+        if sample_steps is not None:
+            num_steps = sample_steps
         device = next(self.model.parameters()).device
-        x = torch.randn(batch_size, self.in_channels, self.image_size, self.image_size, device=device)
+        x = torch.randn(batch_size, self.in_channels, *self.image_shape, device=device)
 
         cond_tensor = cond["cond"] if isinstance(cond, dict) else cond
         if cond_tensor is not None:
@@ -190,60 +190,131 @@ class FlowMatchingModel(BaseGenerativeModule):
 if __name__ == "__main__":
     import lightning as pl
     from lightning.pytorch.loggers import WandbLogger
-    from torch.utils.data import DataLoader, random_split
+    from lightning.pytorch.callbacks import ModelCheckpoint
+    from torch.utils.data import DataLoader, Subset
     from generative_models_lightning.backbones.cond_unet import UNetModel
-    from data_module.ColoRadar.dataset import ColoRadarDataset
+    from data_module.ColoRadar.dataset import ColoRadarDataset3D
     from callbacks.plot_generated_data import PlotGeneratedDataCallback
 
-    # ──parameters────────────────────────────────────────────────────────────
-    DATA_ROOT       = "/home/local/Desktop/code/Datasets/ColoRadar/COLO_RPD_Dataset"
-    SEQUENCES       = [f"{DATA_ROOT}/c4c_garage_run0"]
-    IMAGE_SIZE      = 64
-    BATCH_SIZE      = 8
+    # ── parameters ───────────────────────────────────────────────────────────
+    DATA_ROOT       = "/home/local/Desktop/code/Datasets/coloradar_plus/kitti"
+    RUN_ROOTS       = [
+        f"{DATA_ROOT}/ec_courtyard_run0",
+        #f"{DATA_ROOT}/ec_courtyard_run1",
+        #f"{DATA_ROOT}/ec_courtyard_run2",
+        #f"{DATA_ROOT}/ec_courtyard_run3",
+    ]
+    SEQUENCES       = [
+        f"{run_root}/seq" for run_root in RUN_ROOTS
+    ]
+    # Training data projection mode:
+    # - "direct_frame": no accumulation, project each frame's own point cloud to range image
+    # - "accumulated_scene": build/use merged scene point clouds, then project by pose
+    TRAIN_PROJECTION_MODE = "direct_frame"
+    # Cache filename inside each run's cache dir. Leave None to follow the dataset default:
+    # - direct_frame -> direct_frame_range_images.pt
+    # - accumulated_scene -> range_images.pt
+    TRAIN_RANGE_IMAGE_CACHE_NAME = None
+    DATA_CACHE_DIR  = "per_run"
+    IMAGE_SHAPE     = (60, 128)   # LiDAR range image 实际空间尺寸 [H, W]
+    BATCH_SIZE      = 16
     NUM_WORKERS     = 4
-    MAX_EPOCHS      = 100
+    MAX_EPOCHS      = 500
     LR              = 1e-4
     WEIGHT_DECAY    = 0.0
     WARMUP_STEPS    = 2000
     DROP_RATE       = 0.1
-    IN_CHANNELS     = 1    # LiDAR BEV 单通道
-    COND_CHANNELS   = 1    # 雷达 range-azimuth 单通道
-    NUM_CLASSES     = COND_CHANNELS  # SPADE 条件通道数
+    IN_CHANNELS     = 1    # LiDAR range image 单通道
+    COND_CHANNELS   = 16   # 雷达 range image 16 通道
+    NUM_CLASSES     = COND_CHANNELS
+    TRAIN_SPLIT     = 0.8
     VAL_SPLIT       = 0.1
+    TEST_SPLIT      = 0.1
     SEED            = 42
     CKPT_DIR        = "checkpoints/flow"
+    RESUME_CKPT     = os.path.join(CKPT_DIR, "last.ckpt")
+    GPU_ID          = 1
     # ─────────────────────────────────────────────────────────────────────────
 
     pl.seed_everything(SEED)
 
-    # 数据集
-    dataset = ColoRadarDataset(image_size=IMAGE_SIZE, sequence=SEQUENCES)
-    n_val   = max(1, int(len(dataset) * VAL_SPLIT))
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val])
+    # 数据集（legacy 模式：直接加载预处理好的 .npy 点云）
+    dataset = ColoRadarDataset3D(
+        image_size=IMAGE_SHAPE[0],
+        sequence=SEQUENCES,
+        projection_mode=TRAIN_PROJECTION_MODE,
+        range_image_cache_name=TRAIN_RANGE_IMAGE_CACHE_NAME,
+        cache_dir=DATA_CACHE_DIR,
+    )
+    print(
+        f"Training dataset mode: projection_mode={TRAIN_PROJECTION_MODE}, "
+        f"range_image_cache_name={TRAIN_RANGE_IMAGE_CACHE_NAME}"
+    )
+
+    def _matched_frame_count(seq: str) -> int:
+        lidar_dir = os.path.join(seq, "lidar_pcl")
+        radar_dir = os.path.join(seq, "pcl_npy")
+        lidar_ids = {
+            int(os.path.splitext(name)[0])
+            for name in os.listdir(lidar_dir)
+            if name.endswith(".npy")
+        }
+        radar_ids = {
+            int(os.path.splitext(name)[0])
+            for name in os.listdir(radar_dir)
+            if name.endswith(".npy")
+        }
+        return len(lidar_ids & radar_ids)
+
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    test_indices: list[int] = []
+    offset = 0
+    for seq in SEQUENCES:
+        n = _matched_frame_count(seq)
+        n_train = int(n * TRAIN_SPLIT)
+        n_val = int(n * VAL_SPLIT)
+        train_indices.extend(range(offset, offset + n_train))
+        val_indices.extend(range(offset + n_train, offset + n_train + n_val))
+        test_indices.extend(range(offset + n_train + n_val, offset + n))
+        offset += n
+
+    assert offset == len(dataset), (
+        f"Split counts ({offset}) do not match dataset length ({len(dataset)})"
+    )
+    print(
+        f"Dataset split: train={len(train_indices)}, "
+        f"val={len(val_indices)}, test={len(test_indices)}"
+    )
+
+    train_set = Subset(dataset, train_indices)
+    val_set   = Subset(dataset, val_indices)
+    test_set  = Subset(dataset, test_indices)
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, persistent_workers=True)
     val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=NUM_WORKERS, persistent_workers=True)
+    test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, persistent_workers=True)
 
-    # UNet backbone
+    # UNet backbone（out_channels=IN_CHANNELS*2 仅为兼容接口，flow 只用前 IN_CHANNELS 通道）
     unet = UNetModel(
-        image_size          = IMAGE_SIZE,
-        in_channels         = IN_CHANNELS,
-        model_channels      = 64,
-        out_channels        = IN_CHANNELS * 2,
-        num_res_blocks      = 2,
-        attention_resolutions = (8, 16),
-        num_classes         = NUM_CLASSES,
-        dropout             = 0.0,
-        channel_mult        = (1, 2, 4, 8),
+        image_size            = IMAGE_SHAPE,
+        in_channels           = IN_CHANNELS,
+        model_channels        = 64,
+        out_channels          = IN_CHANNELS * 2,
+        num_res_blocks        = 2,
+        attention_resolutions = (2, 4),
+        num_classes           = NUM_CLASSES,
+        dropout               = 0.0,
+        channel_mult          = (1, 2, 4),
     )
 
     model = FlowMatchingModel(
         model         = unet,
         in_channels   = IN_CHANNELS,
-        image_size    = IMAGE_SIZE,
+        image_shape   = IMAGE_SHAPE,
         drop_rate     = DROP_RATE,
         lr            = LR,
         weight_decay  = WEIGHT_DECAY,
@@ -252,19 +323,61 @@ if __name__ == "__main__":
 
     os.makedirs(CKPT_DIR, exist_ok=True)
 
-    wandb_logger = WandbLogger(project="generative_models", entity="ELAB", save_dir=CKPT_DIR)
-    sample_cb    = PlotGeneratedDataCallback(dataset, num_samples=20, log_every_n_epochs=5, cond_is_image=True)
+    wandb_logger = WandbLogger(project="generative_models", entity="ELAB", save_dir=CKPT_DIR,
+                               name="radar_flow")
+    sample_cb    = PlotGeneratedDataCallback(
+        dataset,
+        num_samples=4,
+        log_every_n_epochs=1,
+        cond_is_image=True,
+        sample_steps=50,
+    )
+
+    class SaveLatestCheckpoint(pl.Callback):
+        """Overwrite last.ckpt every epoch, independent of validation-loss ranking."""
+
+        def __init__(self, dirpath: str, filename: str = "last.ckpt"):
+            self.path = os.path.join(dirpath, filename)
+
+        def _save(self, trainer: pl.Trainer) -> None:
+            if trainer.sanity_checking or not trainer.is_global_zero:
+                return
+            trainer.save_checkpoint(self.path)
+
+        def on_validation_end(self, trainer: pl.Trainer, _pl_module: pl.LightningModule) -> None:
+            self._save(trainer)
+
+        def on_exception(
+            self,
+            trainer: pl.Trainer,
+            _pl_module: pl.LightningModule,
+            _exception: BaseException,
+        ) -> None:
+            self._save(trainer)
+
+    latest_ckpt_cb = SaveLatestCheckpoint(CKPT_DIR)
+    ckpt_cb = ModelCheckpoint(
+        dirpath            = os.path.join(CKPT_DIR, "periodic"),
+        filename           = "flow2-{epoch:03d}",
+        every_n_epochs     = 10,
+        save_top_k         = -1,
+        save_on_exception  = True,
+    )
 
     trainer = pl.Trainer(
         max_epochs          = MAX_EPOCHS,
-        accelerator         = "auto",
-        devices             = "auto",
+        accelerator         = "gpu",
+        devices             = [GPU_ID],
         precision           = "32-true",
         default_root_dir    = CKPT_DIR,
-        log_every_n_steps   = 10,
+        log_every_n_steps   = 1,
         logger              = wandb_logger,
-        callbacks           = [sample_cb],
+        callbacks           = [sample_cb, latest_ckpt_cb, ckpt_cb],
     )
 
-    trainer.fit(model, train_loader, val_loader)
-
+    trainer.fit(
+        model,
+        train_loader,
+        val_loader,
+        #ckpt_path=RESUME_CKPT if os.path.exists(RESUME_CKPT) else None,
+    )

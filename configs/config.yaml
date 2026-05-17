@@ -1,0 +1,103 @@
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+dataset: coloradar_plus
+radar: spectrum
+lidar: pointcloud
+align: radar_frame
+dataloader: default
+
+datasets:
+  coloradar_plus:
+    name: coloradar_plus
+    root: /path/to/coloradar_plus
+
+    # Filename-based MVP indexing. For the current ColoRadar+ layout this
+    # pairs samples by `<record_id>/<frame_stem>`.
+    sequence_depth: 1
+    radar_glob: "**/cascade/adc_samples/data/*.bin"
+    lidar_glob: "**/lidar/pointclouds/*.pcd"
+
+    # Existing ColoRadar+ exports in this repo also use raw LiDAR `.bin`.
+    # Keep the PCD path first for the MVP target, and fall back to `.bin`.
+    lidar_fallback_glob: "**/lidar/pointclouds/*.bin"
+    lidar_bin_num_features: 4
+
+    # Prefer a direct radar<-lidar extrinsic if it exists; otherwise compute
+    # it from the existing base->sensor calibration files.
+    direct_extrinsic_candidates:
+      - calib/T_radar_lidar.npy
+      - calib/T_radar_lidar.txt
+      - calib/T_radar_lidar.json
+    base_to_lidar_path: calib/transforms/base_to_lidar.txt
+    base_to_radar_path: calib/transforms/base_to_radar.txt
+    fallback_to_identity_calibration: true
+
+    # ColoRadar+ raw cascade ADC shape from the current loader code.
+    radar_adc_shape: [12, 16, 16, 256, 2]
+    radar_adc_dtype: int16
+
+    # Keep the debug script runnable before exact local file layout is ready.
+    allow_dummy_data: true
+    dummy_num_samples: 2
+    dummy_radar_shape: [12, 16, 16, 256, 2]
+    dummy_num_lidar_points: 64
+
+  coloradar:
+    name: coloradar
+    root: /path/to/coloradar_plus
+    sequence_depth: 1
+    radar_glob: "**/cascade/adc_samples/data/*.bin"
+    lidar_glob: "**/lidar/pointclouds/*.pcd"
+    lidar_fallback_glob: "**/lidar/pointclouds/*.bin"
+    lidar_bin_num_features: 4
+    direct_extrinsic_candidates:
+      - calib/T_radar_lidar.npy
+      - calib/T_radar_lidar.txt
+      - calib/T_radar_lidar.json
+    base_to_lidar_path: calib/transforms/base_to_lidar.txt
+    base_to_radar_path: calib/transforms/base_to_radar.txt
+    fallback_to_identity_calibration: true
+    radar_adc_shape: [12, 16, 16, 256, 2]
+    radar_adc_dtype: int16
+    allow_dummy_data: true
+    dummy_num_samples: 2
+    dummy_radar_shape: [12, 16, 16, 256, 2]
+    dummy_num_lidar_points: 64
+
+  radeft:
+    name: radeft
+    root: /path/to/radeft
+
+radars:
+  spectrum:
+    output_type: spectrum
+    normalize: true
+    fft:
+      enabled: true
+      axes: all
+      shift: false
+
+lidars:
+  pointcloud:
+    output_type: point_cloud
+
+aligns:
+  radar_frame:
+    target_frame: radar
+    use_extrinsic: true
+
+dataloaders:
+  default:
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    pin_memory: false
+    drop_last: false

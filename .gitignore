@@ -30,3 +30,11 @@ checkpoints/flow/lightning_logs/version_0/hparams.yaml
 
 result.gif
 sample.py
+scripts/prepare_ccradar_seq.py
+train_ddpm.py
+
+data_module/ColoRadar/range_image_process/
+sample_ddpm.py
+.gitignore
+samples/
+demo/
