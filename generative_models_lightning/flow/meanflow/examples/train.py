@@ -4,6 +4,7 @@
 
 import os
 import time
+from pathlib import Path
 
 import torch
 import torchvision
@@ -16,11 +17,16 @@ from generative_models_lightning.flow.meanflow import MeanFlow
 from generative_models_lightning.flow.meanflow.models import MFDiT
 
 
+GENERATE_RESULT_ROOT = Path("/home/local/Desktop/code/Datasets/Processing/Generate_result")
+IMAGE_DIR = GENERATE_RESULT_ROOT / "samples" / "meanflow_examples"
+CHECKPOINT_DIR = GENERATE_RESULT_ROOT / "checkpoints" / "meanflow_examples"
+
+
 if __name__ == "__main__":
     n_steps = 200000
     batch_size = 48
-    os.makedirs("images", exist_ok=True)
-    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     accelerator = Accelerator(mixed_precision="fp16")
 
     dataset = torchvision.datasets.CIFAR10(
@@ -127,12 +133,12 @@ if __name__ == "__main__":
                     model_module = model.module if hasattr(model, "module") else model
                     z = meanflow.sample_each_class(model_module, 1)
                     log_img = make_grid(z, nrow=10)
-                    img_save_path = f"images/step_{global_step}.png"
+                    img_save_path = IMAGE_DIR / f"step_{global_step}.png"
                     save_image(log_img, img_save_path)
                 accelerator.wait_for_everyone()
                 model.train()
 
     if accelerator.is_main_process:
         model_module = model.module if hasattr(model, "module") else model
-        ckpt_path = f"checkpoints/step_{global_step}.pt"
+        ckpt_path = CHECKPOINT_DIR / f"step_{global_step}.pt"
         accelerator.save(model_module.state_dict(), ckpt_path)

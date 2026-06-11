@@ -2,7 +2,7 @@
 
 from .meanflow import MeanFlow, Normalizer
 
-__all__ = ["MeanFlow", "Normalizer", "MFDiT"]
+__all__ = ["MeanFlow", "Normalizer", "MFDiT", "MFUNet", "MeanFlowConditionedUNet"]
 
 
 def __getattr__(name):
@@ -10,4 +10,12 @@ def __getattr__(name):
         from .models import MFDiT
 
         return MFDiT
+    if name == "MFUNet":
+        from .models import MFUNet
+
+        return MFUNet
+    if name == "MeanFlowConditionedUNet":
+        from .models import MeanFlowConditionedUNet
+
+        return MeanFlowConditionedUNet
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -23,10 +23,12 @@ class PlotGeneratedDataCallback(pl.Callback):
     RADAR_CMAP = LIDAR_CMAP
 
     def __init__(self, dataset, num_samples: int = 4, log_every_n_epochs: int = 1,
-                 cond_is_image: bool = False, sample_steps: int | None = 50):
+                 cond_is_image: bool = False, sample_steps: int | None = 50,
+                 stop_on_nonfinite: bool = False):
         self.num_samples = num_samples
         self.log_every_n_epochs = log_every_n_epochs
         self.sample_steps = sample_steps
+        self.stop_on_nonfinite = stop_on_nonfinite
         indices = list(range(num_samples))
         self.cond = torch.stack([dataset[i][1]["cond"] for i in indices])
         gt = torch.stack([dataset[i][0] for i in indices]).clamp(-1, 1)
@@ -65,7 +67,7 @@ class PlotGeneratedDataCallback(pl.Callback):
             img_01 = np.clip(img_01 / vmax, 0.0, 1.0)
         colored = matplotlib.colormaps[cmap_name](img_01)[..., :3].astype(np.float32)
         colored[~valid] = 0.0
-        return torch.from_numpy(colored.transpose(2, 0, 1)).to(tensor_chw.device)
+        return torch.from_numpy(colored.transpose(2, 0, 1))
 
     @classmethod
     def _plot_lidar_batch(cls, batch_nchw: torch.Tensor) -> torch.Tensor:
@@ -87,6 +89,19 @@ class PlotGeneratedDataCallback(pl.Callback):
         mse = torch.mean((img1 - img2) ** 2)
         return 10 * torch.log10(1 / mse)
 
+    @staticmethod
+    def _build_horizontal_grid(
+        gt_vis: torch.Tensor,
+        cond_vis: torch.Tensor,
+        pred_vis: torch.Tensor,
+    ) -> torch.Tensor:
+        """For each sample, show gt | cond | generated from left to right."""
+        rows = torch.stack([
+            torch.cat([gt_vis[idx], cond_vis[idx], pred_vis[idx]], dim=-1)
+            for idx in range(gt_vis.shape[0])
+        ])
+        return make_grid(rows, nrow=1)
+
     def sample_images(self, pl_module: pl.LightningModule):
         cond = {"cond": self.cond.to(pl_module.device)}
         with torch.no_grad():
@@ -95,40 +110,72 @@ class PlotGeneratedDataCallback(pl.Callback):
                 batch_size=self.num_samples,
                 sample_steps=self.sample_steps,
             )
-        return img.clamp(-1, 1).float()
+        return img.clamp(-1, 1).float().cpu()
+
+    @staticmethod
+    def _safe_step(trainer, pl_module: pl.LightningModule, exp) -> int:
+        trainer_step = int(getattr(trainer, "global_step", pl_module.global_step))
+        wandb_step = getattr(exp, "step", None)
+        if isinstance(wandb_step, int):
+            return max(trainer_step, wandb_step)
+        return trainer_step
 
     def on_train_epoch_end(self, trainer, pl_module: pl.LightningModule):
-        if not trainer.is_global_zero:
-            return
-
         if (pl_module.current_epoch + 1) % self.log_every_n_epochs != 0:
             return
 
-        img = self.sample_images(pl_module)
-        img = self._plot_lidar_batch(img)
-        gt   = self.ground_truth.to(img.device)
-        mask = self.cond_vis.to(img.device)
-        psnr = self._psnr(img, gt)
+        device = getattr(pl_module, "device", None)
 
-        # 三行拼接：mask / ground_truth / generated，每行 num_samples 张
-        combined = torch.cat([mask, gt, img], dim=0)  # [3N, 3, H, W]
-        grid = make_grid(combined, nrow=self.num_samples)
+        if getattr(trainer, "world_size", 1) > 1:
+            trainer.strategy.barrier()
 
-        for logger in trainer.loggers:
-            exp = getattr(logger, "experiment", None)
-            if exp is None:
-                continue
-            if hasattr(exp, 'add_image'):
-                exp.add_image("comparison", grid, pl_module.current_epoch)
-                exp.add_scalar("psnr", psnr, pl_module.current_epoch)
-            elif hasattr(exp, 'log'):
+        if trainer.is_global_zero:
+            was_training = pl_module.training
+            pl_module.eval()
+            try:
+                self._release_cuda_cache(device)
                 trainer_step = int(getattr(trainer, "global_step", pl_module.global_step))
-                wandb_step = getattr(exp, "step", None)
-                if isinstance(wandb_step, int):
-                    safe_step = max(trainer_step, wandb_step)
-                else:
-                    safe_step = trainer_step
-                exp.log({
-                    "comparison": wandb.Image(grid),
-                    "psnr": psnr.item(),
-                }, step=safe_step)
+                img = self.sample_images(pl_module)
+                if self.stop_on_nonfinite and not torch.isfinite(img).all():
+                    raise RuntimeError(
+                        f"Non-finite comparison sample detected at global_step={trainer_step}, "
+                        f"epoch={int(pl_module.current_epoch)}"
+                    )
+
+                img_vis = self._plot_lidar_batch(
+                    torch.nan_to_num(img, nan=-1.0, posinf=1.0, neginf=-1.0).clamp(-1, 1)
+                )
+                gt = self.ground_truth
+                mask = self.cond_vis
+                psnr = self._psnr(img_vis, gt)
+                grid = self._build_horizontal_grid(gt, mask, img_vis).detach().cpu()
+
+                for logger in trainer.loggers:
+                    exp = getattr(logger, "experiment", None)
+                    if exp is None:
+                        continue
+                    if hasattr(exp, 'add_image'):
+                        exp.add_image("comparison", grid, pl_module.current_epoch)
+                        exp.add_scalar("psnr", float(psnr.item()), pl_module.current_epoch)
+                    elif hasattr(exp, 'log'):
+                        exp.log({
+                            "trainer/global_step": trainer_step,
+                            "epoch": int(pl_module.current_epoch),
+                            "comparison": wandb.Image(grid),
+                            "psnr": float(psnr.item()),
+                        }, step=self._safe_step(trainer, pl_module, exp))
+                del img, img_vis, gt, mask, psnr, grid
+                self._release_cuda_cache(device)
+            finally:
+                if was_training:
+                    pl_module.train()
+
+        if getattr(trainer, "world_size", 1) > 1:
+            trainer.strategy.barrier()
+        self._release_cuda_cache(device)
+    @staticmethod
+    def _release_cuda_cache(device: torch.device | None = None) -> None:
+        if device is None or device.type != "cuda" or not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()

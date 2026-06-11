@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # @Time    : 2026-04-15
-# @Author  : Chenlin Zhang
+# @Author  : Chenlin Lang
 # @Site    : https://github.com/Wangzhaoze/generative_models_lightning
 # @File    : /train_flow.py
 # @IDE     : vscode
@@ -24,6 +24,7 @@ from generative_models_lightning.flow.solver import ODESolver
 from generative_models_lightning.flow.utils import ModelWrapper
 
 from generative_models_lightning import BaseGenerativeModule
+from output_paths import CHECKPOINTS_ROOT
 
 
 class FlowMatchingModel(BaseGenerativeModule):
@@ -231,7 +232,7 @@ if __name__ == "__main__":
     VAL_SPLIT       = 0.1
     TEST_SPLIT      = 0.1
     SEED            = 42
-    CKPT_DIR        = "checkpoints/flow"
+    CKPT_DIR        = str(CHECKPOINTS_ROOT / "flow")
     RESUME_CKPT     = os.path.join(CKPT_DIR, "last.ckpt")
     GPU_ID          = 1
     # ─────────────────────────────────────────────────────────────────────────
