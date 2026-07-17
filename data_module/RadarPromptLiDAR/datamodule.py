@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
+import lightning as pl
 from torch.utils.data import DataLoader
 
 from .dataset import DEFAULT_ALIGNED_ROOT, DEFAULT_RUN_NAMES, RadarPromptLiDARDataset
@@ -50,7 +51,7 @@ def build_radar_prompt_lidar_dataloader(
     )
 
 
-class RadarPromptLiDARDataModule:
+class RadarPromptLiDARDataModule(pl.LightningDataModule):
     """Minimal wrapper mirroring the repo's lightweight datamodule style."""
 
     def __init__(
@@ -67,6 +68,7 @@ class RadarPromptLiDARDataModule:
         drop_last: bool = False,
         match_target_to_condition: bool = True,
     ):
+        super().__init__()
         self.aligned_root = aligned_root
         self.run_names = tuple(str(name) for name in run_names)
         self.cond_dir_name = cond_dir_name

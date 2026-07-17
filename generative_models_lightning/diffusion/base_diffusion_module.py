@@ -10,15 +10,24 @@
 Diffusion model implementations.
 """
 
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, cast, Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, Optional, cast
 
 import torch
 
 from generative_models_lightning import BaseGenerativeModule, Batch
 import torch.nn as nn
 
-from generative_models_lightning.diffusion.process.gaussian_diffusion import GaussianDiffusion, mean_flat, DiffusionLossType, DiffusionMeanType, DiffusionVarType
+from generative_models_lightning.diffusion.process.gaussian_diffusion import (
+    DiffusionLossType,
+    DiffusionMeanType,
+    DiffusionVarType,
+    GaussianDiffusion,
+    mean_flat,
+)
+from generative_models_lightning.diffusion.process.utils import (
+    get_named_beta_schedule,
+)
 
 
 class BaseDiffusionModule(BaseGenerativeModule):
@@ -32,96 +41,212 @@ class BaseDiffusionModule(BaseGenerativeModule):
 
     def __init__(
         self,
-        diffusion_process: GaussianDiffusion,
         denoiser: nn.Module,
-        mean_type: DiffusionMeanType,
-        var_type: DiffusionVarType,
-        loss_type: DiffusionLossType,
+        diffusion_process: GaussianDiffusion | None = None,
+        mean_type: DiffusionMeanType | str | None = None,
+        var_type: DiffusionVarType | str | None = None,
+        loss_type: DiffusionLossType | str | None = None,
+        num_timesteps: int = 1000,
+        beta_schedule: str = "cosine",
+        rescale_timesteps: bool = False,
+        sample_shape: Sequence[int] | None = None,
+        lr: float = 1e-4,
+        weight_decay: float = 0.01,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(lr=lr, weight_decay=weight_decay, **kwargs)
+
+        resolved_mean = self._resolve_enum(
+            mean_type,
+            DiffusionMeanType,
+            default=(
+                diffusion_process.model_mean_type
+                if diffusion_process is not None
+                else DiffusionMeanType.EPSILON
+            ),
+        )
+        resolved_var = self._resolve_enum(
+            var_type,
+            DiffusionVarType,
+            default=(
+                diffusion_process.model_var_type
+                if diffusion_process is not None
+                else DiffusionVarType.LEARNED_RANGE
+            ),
+        )
+        resolved_loss = self._resolve_enum(
+            loss_type,
+            DiffusionLossType,
+            default=(
+                diffusion_process.loss_type
+                if diffusion_process is not None
+                else DiffusionLossType.RESCALED_MSE
+            ),
+        )
+        if diffusion_process is None:
+            if num_timesteps <= 0:
+                raise ValueError("num_timesteps must be greater than zero")
+            diffusion_process = GaussianDiffusion(
+                betas=get_named_beta_schedule(beta_schedule, num_timesteps),
+                model_mean_type=resolved_mean,
+                model_var_type=resolved_var,
+                loss_type=resolved_loss,
+                rescale_timesteps=rescale_timesteps,
+            )
+        else:
+            expected = (resolved_mean, resolved_var, resolved_loss)
+            actual = (
+                diffusion_process.model_mean_type,
+                diffusion_process.model_var_type,
+                diffusion_process.loss_type,
+            )
+            if actual != expected:
+                raise ValueError(
+                    "diffusion_process types do not match mean_type/var_type/loss_type: "
+                    f"process={actual}, module={expected}"
+                )
+
         self.diffusion_process = diffusion_process
         self.denoiser = denoiser
-        self.mean_type = mean_type
-        self.var_type = var_type
-        self.loss_type = loss_type
+        self.mean_type = resolved_mean
+        self.var_type = resolved_var
+        self.loss_type = resolved_loss
+        self.sample_shape = (
+            tuple(int(value) for value in sample_shape)
+            if sample_shape is not None
+            else None
+        )
+        if self.sample_shape is not None and any(value <= 0 for value in self.sample_shape):
+            raise ValueError("sample_shape dimensions must be greater than zero")
+
+        self.save_hyperparameters(ignore=("denoiser", "diffusion_process"))
+
+    @staticmethod
+    def _resolve_enum(value, enum_type, *, default):
+        if value is None:
+            return default
+        if isinstance(value, enum_type):
+            return value
+        if isinstance(value, str):
+            key = value.strip().upper()
+            try:
+                return enum_type[key]
+            except KeyError as error:
+                available = ", ".join(item.name.lower() for item in enum_type)
+                raise ValueError(
+                    f"Unknown {enum_type.__name__} value {value!r}; "
+                    f"choose one of: {available}"
+                ) from error
+        raise TypeError(
+            f"{enum_type.__name__} must be a string or enum value, "
+            f"got {type(value).__name__}"
+        )
+
+    @staticmethod
+    def _unpack_batch(batch) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if isinstance(batch, Mapping):
+            if "x" not in batch:
+                raise KeyError("Diffusion batch mapping must contain 'x'")
+            x = batch["x"]
+            cond = batch.get("cond")
+        elif isinstance(batch, (tuple, list)) and len(batch) == 2:
+            x, condition = batch
+            cond = condition.get("cond") if isinstance(condition, Mapping) else condition
+        elif isinstance(batch, torch.Tensor):
+            x, cond = batch, None
+        else:
+            raise TypeError(
+                "Diffusion batch must be a mapping, tensor, or (x, condition) pair"
+            )
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"batch input must be a Tensor, got {type(x).__name__}")
+        if cond is not None and not isinstance(cond, torch.Tensor):
+            raise TypeError(f"batch condition must be a Tensor, got {type(cond).__name__}")
+        return x, cond
+
+    def _shared_step(self, batch, stage: str) -> torch.Tensor:
+        x_start, cond = self._unpack_batch(batch)
+        t = torch.randint(
+            low=0,
+            high=self.diffusion_process.num_timesteps,
+            size=(x_start.shape[0],),
+            device=x_start.device,
+        )
+        losses = self._compute_losses(
+            x_start=x_start,
+            t=t,
+            model_kwargs={"y": cond} if cond is not None else None,
+        )
+        if "loss" not in losses:
+            raise ValueError("Expected 'loss' key in losses dict")
+        loss = losses["loss"].mean()
+        self.log(
+            f"{stage}/loss",
+            loss,
+            prog_bar=True,
+            on_step=stage == "train",
+            on_epoch=True,
+            sync_dist=True,
+        )
+        for name, value in losses.items():
+            if name != "loss":
+                self.log(
+                    f"{stage}/{name}",
+                    value.mean(),
+                    on_step=stage == "train",
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+        return loss
 
     def training_step(self, batch: Batch, batch_idx: int):
-        t=torch.randint(
-            low=0, 
-            high=self.diffusion_process.num_timesteps, 
-            size=(batch["x"].shape[0],), 
-            device=batch["x"].device
-            )
-        losses = self._compute_losses(
-            x_start=batch["x"],
-            t=t,
-            model_kwargs={"y": batch["cond"]} if batch.get("cond") is not None else None,
-        )
+        _ = batch_idx
+        return self._shared_step(batch, "train")
 
-        # Extract main loss
-        if isinstance(losses, dict) and "loss" in losses:
-            loss = losses["loss"].mean()
-        else:
-            raise ValueError("Expected 'loss' key in losses dict.")
-        # Log loss
-        self.log("val/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        
-        # Log other loss components (if any)
-        if isinstance(losses, dict):
-            for k, v in losses.items():
-                if k == "loss":
-                    continue
-                try:
-                    val = v.mean()
-                    self.log(f"val/{k}", val, on_step=True, on_epoch=True, sync_dist=True)
-                except Exception:
-                    pass
-        
-        return loss
-    
     def validation_step(self, batch: Batch, batch_idx: int):
-        t=torch.randint(
-            low=0, 
-            high=self.diffusion_process.num_timesteps, 
-            size=(batch["x"].shape[0],), 
-            device=batch["x"].device
-            )
-        losses = self._compute_losses(
-            x_start=batch["x"],
-            t=t,
-            model_kwargs={"y": batch["cond"]} if batch.get("cond") is not None else None,
-        )
+        _ = batch_idx
+        return self._shared_step(batch, "val")
 
-        # Extract main loss
-        if isinstance(losses, dict) and "loss" in losses:
-            loss = losses["loss"].mean()
-        else:
-            raise ValueError("Expected 'loss' key in losses dict.")
-        # Log loss
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        
-        # Log other loss components (if any)
-        if isinstance(losses, dict):
-            for k, v in losses.items():
-                if k == "loss":
-                    continue
-                try:
-                    val = v.mean()
-                    self.log(f"train/{k}", val, on_step=True, on_epoch=True, sync_dist=True)
-                except Exception:
-                    pass
-        
-        return loss
 
-    
-    def generate(self, batch: Batch, *args, **kwargs):
+    def generate(
+        self,
+        batch=None,
+        *,
+        batch_size: int | None = None,
+        shape: Sequence[int] | None = None,
+        cond: torch.Tensor | Mapping[str, Any] | None = None,
+        model_kwargs: Optional[Mapping[str, Any]] = None,
+        progress: bool = False,
+    ):
+        x = None
+        batch_cond = None
+        if batch is not None:
+            x, batch_cond = self._unpack_batch(batch)
+        if cond is None:
+            cond = batch_cond
+        if isinstance(cond, Mapping):
+            cond = cond.get("cond")
+
+        if shape is None:
+            if x is not None:
+                shape = tuple(x.shape)
+            elif self.sample_shape is not None:
+                shape = (int(batch_size or 1), *self.sample_shape)
+            else:
+                raise ValueError(
+                    "Generation requires batch, shape, or configured sample_shape"
+                )
+        shape = tuple(int(value) for value in shape)
+        kwargs = dict(model_kwargs or {})
+        if cond is not None:
+            kwargs["y"] = cond
         with torch.no_grad():
             generated = self.diffusion_process.p_sample_loop(
                 self.denoiser,
-                batch["x"],
+                shape,
                 device=self.device,
-                model_kwargs=kwargs
+                model_kwargs=kwargs,
+                progress=progress,
             )
         return generated
 

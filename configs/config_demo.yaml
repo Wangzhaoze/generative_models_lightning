@@ -1,0 +1,94 @@
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+seed: 42
+
+# Shared tensor geometry. The condition channels must match the radar tensor.
+image_shape: [64, 64]
+in_channels: 1
+cond_channels: 1
+
+model:
+  _target_: generative_models_lightning.diffusion.base_diffusion_module.BaseDiffusionModule
+
+  # BaseDiffusionModule builds GaussianDiffusion from these Hydra-friendly values.
+  num_timesteps: 1000
+  beta_schedule: cosine        # linear | cosine
+  mean_type: epsilon           # previous_x | start_x | epsilon
+  var_type: learned_range      # learned | fixed_small | fixed_large | learned_range
+  loss_type: rescaled_mse      # mse | rescaled_mse | kl | rescaled_kl
+  rescale_timesteps: false
+
+  # Used by model.generate(batch_size=...). Format: [C, H, W].
+  sample_shape:
+    - ${in_channels}
+    - ${image_shape.0}
+    - ${image_shape.1}
+  lr: 1.0e-4
+  weight_decay: 0.0
+
+  denoiser:
+    _target_: generative_models_lightning.backbones.cond_unet.UNetModel
+    image_size: ${image_shape}
+    in_channels: ${in_channels}
+    model_channels: 64
+    # learned/learned_range variance predicts mean and variance, hence 2C.
+    out_channels: 2
+    num_res_blocks: 2
+    attention_resolutions: [2, 4]
+    num_classes: ${cond_channels}
+    dropout: 0.0
+    channel_mult: [1, 2, 4]
+    conv_resample: true
+    dims: 2
+    use_checkpoint: false
+    use_fp16: false
+    num_heads: 1
+    num_head_channels: -1
+    num_heads_upsample: -1
+    use_scale_shift_norm: false
+    resblock_updown: false
+    use_new_attention_order: false
+
+data_module:
+  _target_: data_module.RadarPromptLiDAR.datamodule.RadarPromptLiDARDataModule
+  aligned_root: ${oc.env:RALD_ALIGNED_ROOT,/home/local/Desktop/code/Datasets/processing/aligned}
+  run_names:
+    - ec_courtyard_run0
+    - ec_courtyard_run1
+    - ec_courtyard_run2
+  cond_dir_name: radar
+  target_dir_name: camera
+  spatial_size: ${image_shape}
+  batch_size: 4
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  match_target_to_condition: true
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  accelerator: auto
+  devices: 1
+  strategy: auto
+  precision: 32-true
+  max_epochs: 100
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+  deterministic: false
+  benchmark: true
+  default_root_dir: outputs/diffusion_demo
+  enable_checkpointing: true
+  enable_progress_bar: true
+  logger: false
