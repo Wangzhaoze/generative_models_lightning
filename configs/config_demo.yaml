@@ -16,9 +16,9 @@ in_channels: 1
 cond_channels: 1
 
 model:
-  _target_: generative_models_lightning.diffusion.base_diffusion_module.BaseDiffusionModule
+  _target_: generative_models_lightning.diffusion.gaussian_diffusion_module.GaussianDiffusionModule
 
-  # BaseDiffusionModule builds GaussianDiffusion from these Hydra-friendly values.
+  # GaussianDiffusionModule builds the discrete DDPM process from these values.
   num_timesteps: 1000
   beta_schedule: cosine        # linear | cosine
   mean_type: epsilon           # previous_x | start_x | epsilon

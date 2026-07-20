@@ -1,0 +1,100 @@
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/edm/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false
+
+seed: 42
+
+# The KL-VAE adapter you add later must emit target latents x with shape:
+# [batch, n_latents, channels].
+latent:
+  n_latents: 512
+  channels: 8
+
+# This describes the raw radar cube sent to EDMPrecond.
+# The dimensions below match RadarEncoder's default input resolution. Override
+# them to exactly match your processed radar-cube data.
+radar:
+  cond_type: radar
+  use_radar_enc: true
+  # Keep this true until a pretrained RadarEncoder checkpoint is explicitly
+  # loaded. Freezing a randomly initialized encoder would prevent conditioning
+  # from learning.
+  unfreeze_radar_enc: true
+  radar_token_channel: 256
+  enc_hidden_ch: 128
+  enc_radar_ch: 16
+  input_radar_r_dim: 128
+  input_radar_a_dim: 64
+  input_radar_e_dim: 32
+  enc_radar_r_dim: 8
+  enc_radar_a_dim: 4
+  enc_radar_e_dim: 2
+
+model:
+  _target_: generative_models_lightning.diffusion.edm_diffusion_module.EDMDiffusionModule
+  sample_shape:
+    - ${latent.n_latents}
+    - ${latent.channels}
+  p_mean: -1.2
+  p_std: 1.2
+  sigma_data: 1.0
+  num_steps: 18
+  sigma_min: 0.002
+  sigma_max: 80.0
+  rho: 7.0
+  condition_key: cond
+  condition_type: ${radar.cond_type}
+  lr: 1.0e-4
+  weight_decay: 0.0
+
+  denoiser:
+    _target_: generative_models_lightning.diffusion.process_edm.models_radar_generation.EDMPrecond
+    n_latents: ${latent.n_latents}
+    channels: ${latent.channels}
+    sigma_data: ${model.sigma_data}
+    n_heads: 8
+    d_head: 64
+    depth: 12
+    use_fp16: false
+    configs: ${radar}
+
+# This existing datamodule currently returns image targets and 2D radar maps.
+# Replace it with your KL-VAE latent adapter before EDM training: it must return
+# (target_latent, {"cond": raw_radar_cube}), where raw_radar_cube is
+# [B, R, A, E, C] after DataLoader collation.
+data_module:
+  _target_: data_module.RadarPromptLiDAR.datamodule.RadarPromptLiDARDataModule
+  aligned_root: ${oc.env:RALD_ALIGNED_ROOT,/home/local/Desktop/code/Datasets/processing/aligned}
+  run_names:
+    - ec_courtyard_run0
+    - ec_courtyard_run1
+    - ec_courtyard_run2
+  cond_dir_name: radar
+  target_dir_name: camera
+  batch_size: 4
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  match_target_to_condition: true
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  accelerator: auto
+  devices: 1
+  strategy: auto
+  precision: 32-true
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+  default_root_dir: outputs/edm
+  enable_checkpointing: true
+  enable_progress_bar: true
+  logger: false

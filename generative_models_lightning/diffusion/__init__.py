@@ -12,6 +12,7 @@
 Describe the purpose of this module.
 """
 
+from .gaussian_diffusion_module import GaussianDiffusionModule
 from .base_diffusion_module import BaseDiffusionModule
-
+from .edm_diffusion_module import EDMDiffusionModule
 from .process import GaussianDiffusion, DiffusionLossType, DiffusionMeanType, DiffusionVarType, mean_flat, SpacedDiffusion, space_timesteps, get_named_beta_schedule

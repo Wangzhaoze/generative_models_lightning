@@ -15,7 +15,9 @@ from typing import Any, Dict, Optional, cast
 
 import torch
 
-from generative_models_lightning import BaseGenerativeModule, Batch
+from generative_models_lightning.diffusion.base_diffusion_module import (
+    BaseDiffusionModule,
+)
 import torch.nn as nn
 
 from generative_models_lightning.diffusion.process.gaussian_diffusion import (
@@ -30,13 +32,16 @@ from generative_models_lightning.diffusion.process.utils import (
 )
 
 
-class BaseDiffusionModule(BaseGenerativeModule):
+class GaussianDiffusionModule(BaseDiffusionModule):
     """
-    Shared LightningModule scaffolding for diffusion models.
+    Lightning module for discrete Gaussian diffusion models such as DDPM.
 
-    Diffusion modules own batch interpretation and optimization-time orchestration.
-    The underlying diffusion process stays responsible for process-specific
-    forward/reverse diffusion math and sampling routines.
+    This module owns DDPM-specific concepts:
+    - discrete timesteps t
+    - beta schedule
+    - GaussianDiffusion
+    - epsilon/x0/variance objectives
+    - DDPM reverse sampling
     """
 
     def __init__(
@@ -54,7 +59,12 @@ class BaseDiffusionModule(BaseGenerativeModule):
         weight_decay: float = 0.01,
         **kwargs,
     ):
-        super().__init__(lr=lr, weight_decay=weight_decay, **kwargs)
+        super().__init__(
+        sample_shape=sample_shape,
+        lr=lr,
+        weight_decay=weight_decay,
+        **kwargs,
+        )
 
         resolved_mean = self._resolve_enum(
             mean_type,
@@ -142,114 +152,74 @@ class BaseDiffusionModule(BaseGenerativeModule):
             f"got {type(value).__name__}"
         )
 
-    @staticmethod
-    def _unpack_batch(batch) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if isinstance(batch, Mapping):
-            if "x" not in batch:
-                raise KeyError("Diffusion batch mapping must contain 'x'")
-            x = batch["x"]
-            cond = batch.get("cond")
-        elif isinstance(batch, (tuple, list)) and len(batch) == 2:
-            x, condition = batch
-            cond = condition.get("cond") if isinstance(condition, Mapping) else condition
-        elif isinstance(batch, torch.Tensor):
-            x, cond = batch, None
+    def compute_loss_terms(
+        self,
+        x: torch.Tensor,
+        cond: Any | None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        DDPM-specific training loss.
+
+        Sample a discrete timestep t, add noise through GaussianDiffusion,
+        then compute epsilon/x0/VLB-related loss terms.
+        """
+        if cond is None:
+            model_kwargs = None
+        elif isinstance(cond, torch.Tensor):
+            # Keep compatibility with the existing conditional UNet interface.
+            model_kwargs = {"y": cond}
+        elif isinstance(cond, Mapping):
+            # Advanced callers may directly provide {"y": ..., "s": ...}.
+            model_kwargs = dict(cond)
         else:
             raise TypeError(
-                "Diffusion batch must be a mapping, tensor, or (x, condition) pair"
+                "GaussianDiffusionModule cond must be a Tensor, mapping, or None"
             )
-        if not isinstance(x, torch.Tensor):
-            raise TypeError(f"batch input must be a Tensor, got {type(x).__name__}")
-        if cond is not None and not isinstance(cond, torch.Tensor):
-            raise TypeError(f"batch condition must be a Tensor, got {type(cond).__name__}")
-        return x, cond
 
-    def _shared_step(self, batch, stage: str) -> torch.Tensor:
-        x_start, cond = self._unpack_batch(batch)
         t = torch.randint(
             low=0,
             high=self.diffusion_process.num_timesteps,
-            size=(x_start.shape[0],),
-            device=x_start.device,
+            size=(x.shape[0],),
+            device=x.device,
         )
-        losses = self._compute_losses(
-            x_start=x_start,
+
+        return self._compute_losses(
+            x_start=x,
             t=t,
-            model_kwargs={"y": cond} if cond is not None else None,
+            model_kwargs=model_kwargs,
         )
-        if "loss" not in losses:
-            raise ValueError("Expected 'loss' key in losses dict")
-        loss = losses["loss"].mean()
-        self.log(
-            f"{stage}/loss",
-            loss,
-            prog_bar=True,
-            on_step=stage == "train",
-            on_epoch=True,
-            sync_dist=True,
-        )
-        for name, value in losses.items():
-            if name != "loss":
-                self.log(
-                    f"{stage}/{name}",
-                    value.mean(),
-                    on_step=stage == "train",
-                    on_epoch=True,
-                    sync_dist=True,
-                )
-        return loss
-
-    def training_step(self, batch: Batch, batch_idx: int):
-        _ = batch_idx
-        return self._shared_step(batch, "train")
-
-    def validation_step(self, batch: Batch, batch_idx: int):
-        _ = batch_idx
-        return self._shared_step(batch, "val")
 
 
-    def generate(
+    @torch.no_grad()
+    def sample(
         self,
-        batch=None,
+        shape: Sequence[int],
+        cond: Any | None = None,
         *,
-        batch_size: int | None = None,
-        shape: Sequence[int] | None = None,
-        cond: torch.Tensor | Mapping[str, Any] | None = None,
-        model_kwargs: Optional[Mapping[str, Any]] = None,
         progress: bool = False,
-    ):
-        x = None
-        batch_cond = None
-        if batch is not None:
-            x, batch_cond = self._unpack_batch(batch)
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """DDPM-specific reverse sampling."""
+        model_kwargs = dict(kwargs)
+
         if cond is None:
-            cond = batch_cond
-        if isinstance(cond, Mapping):
-            cond = cond.get("cond")
-
-        if shape is None:
-            if x is not None:
-                shape = tuple(x.shape)
-            elif self.sample_shape is not None:
-                shape = (int(batch_size or 1), *self.sample_shape)
-            else:
-                raise ValueError(
-                    "Generation requires batch, shape, or configured sample_shape"
-                )
-        shape = tuple(int(value) for value in shape)
-        kwargs = dict(model_kwargs or {})
-        if cond is not None:
-            kwargs["y"] = cond
-        with torch.no_grad():
-            generated = self.diffusion_process.p_sample_loop(
-                self.denoiser,
-                shape,
-                device=self.device,
-                model_kwargs=kwargs,
-                progress=progress,
+            pass
+        elif isinstance(cond, torch.Tensor):
+            model_kwargs["y"] = cond
+        elif isinstance(cond, Mapping):
+            model_kwargs = {**dict(cond), **model_kwargs}
+        else:
+            raise TypeError(
+                "GaussianDiffusionModule cond must be a Tensor, mapping, or None"
             )
-        return generated
 
+        return self.diffusion_process.p_sample_loop(
+            self.denoiser,
+            tuple(int(value) for value in shape),
+            device=self.device,
+            model_kwargs=model_kwargs,
+            progress=progress,
+        )
 
     def _compute_losses(
         self,

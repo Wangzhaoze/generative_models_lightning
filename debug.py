@@ -2,7 +2,7 @@
 import torch
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
-from generative_models_lightning.diffusion.base_diffusion_module import BaseDiffusionModule
+from generative_models_lightning.diffusion.gaussian_diffusion_module import GaussianDiffusionModule
 from lightning.pytorch.loggers import TensorBoardLogger
 from generative_models_lightning.backbones.cond_unet import UNetModel
 from generative_models_lightning.diffusion import SpacedDiffusion, space_timesteps, DiffusionLossType, DiffusionMeanType, DiffusionVarType, get_named_beta_schedule
@@ -18,7 +18,7 @@ if __name__ == "__main__":
 
     torch.set_float32_matmul_precision("medium")  # (optional, to use Tensor Cores properly)
 
-    module = BaseDiffusionModule(
+    module = GaussianDiffusionModule(
         denoiser = UNetModel(
             image_size=128,
             in_channels=8,

@@ -4,10 +4,12 @@ import torch.nn.functional as F
 
 from einops import rearrange
 
-from timm.models.layers import DropPath
+from timm.layers import DropPath
 
 import numpy as np
-from model.models_radar_encoder import Encoder as RadarEncoder
+from generative_models_lightning.diffusion.process_edm.models_radar_encoder import (
+    Encoder as RadarEncoder,
+)
 
 def zero_module(module):
     """
@@ -333,26 +335,25 @@ class EDMPrecond(torch.nn.Module):
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
         self.configs = configs
-        self.sample_steps = int(configs.get('sample_steps', 18))
-        if self.sample_steps < 2:
-            raise ValueError(f'sample_steps must be >= 2, got {self.sample_steps}')
-        self.model = LatentArrayTransformer(in_channels=channels, t_channels=256, n_heads=n_heads, d_head=d_head, depth=depth)
+        self.condition_type = self.configs.get("cond_type", None)
+        self.use_radar_enc = self.configs.get("use_radar_enc", False)
         self.unfreeze_radar_enc = self.configs.get('unfreeze_radar_enc', False)
 
-        cond_type = configs.cond_type
+        cond_type = self.condition_type
 
         if cond_type == 'radar':
             # init radar embeddings
             self.radar_token_channel = self.configs.radar_token_channel
             input_radar_ch = 1
             # input_radar_ch = self.configs.input_radar_ch
-            if self.unfreeze_radar_enc:
+            if self.use_radar_enc:
                 self.radar_enc = RadarEncoder(in_channels=input_radar_ch, 
                                 ch=self.configs.enc_hidden_ch,
                                 z_channels=self.configs.enc_radar_ch)
+                self.radar_enc.requires_grad_(self.unfreeze_radar_enc)
 
             # when using radar encoder, the size of radar cube is different, need to use different embedding size
-            if self.configs.use_radar_enc:
+            if self.use_radar_enc:
                 self.radar_r_emb = nn.Embedding(self.configs.enc_radar_r_dim, self.radar_token_channel)
                 self.radar_a_emb = nn.Embedding(self.configs.enc_radar_a_dim, self.radar_token_channel)
                 self.radar_e_emb = nn.Embedding(self.configs.enc_radar_e_dim, self.radar_token_channel)
@@ -362,6 +363,20 @@ class EDMPrecond(torch.nn.Module):
                 self.radar_a_emb = nn.Embedding(self.configs.input_radar_a_dim, self.radar_token_channel)
                 self.radar_e_emb = nn.Embedding(self.configs.input_radar_e_dim, self.radar_token_channel)
                 self.radar_token_project = nn.Linear(input_radar_ch, self.radar_token_channel)
+
+        context_dim = (
+            self.radar_token_channel
+            if cond_type == "radar"
+            else None
+        )
+        self.model = LatentArrayTransformer(
+            in_channels=channels,
+            t_channels=256,
+            n_heads=n_heads,
+            d_head=d_head,
+            depth=depth,
+            context_dim=context_dim,
+        )
 
     def process_radar_cond(self, radar_cube):
         '''
@@ -382,10 +397,15 @@ class EDMPrecond(torch.nn.Module):
 
         
 
-        if self.configs.get('unfreeze_radar_enc', False):
+        if self.use_radar_enc:
             # (B, R, A, E, C) -> (B, C, R, A, E)
             x = radar_cube.permute(0, 4, 1, 2, 3)
-            x = self.radar_enc(x)   #(B, C_out, R, A, E)
+            if self.unfreeze_radar_enc:
+                x = self.radar_enc(x)
+            else:
+                self.radar_enc.eval()
+                with torch.no_grad():
+                    x = self.radar_enc(x)
             # (B, C, R, A, E) -> (B, R, A, E, C)
             radar_cube = x.permute(0, 2, 3, 4, 1)
 
@@ -414,9 +434,24 @@ class EDMPrecond(torch.nn.Module):
 
     def forward(self, x, sigma, label_tokens=None, cond_type=None, force_fp32=False, **model_kwargs):
 
-        if cond_type == 'radar':
+        cond_emb = None
+        active_cond_type = (
+            self.condition_type
+            if cond_type is None
+            else cond_type
+        )
+
+        if active_cond_type == "radar":
+            if label_tokens is None:
+                raise ValueError(
+                    "Radar conditioning requires label_tokens"
+                )
             cond_emb = self.process_radar_cond(label_tokens)
 
+        elif active_cond_type not in (None, "none"):
+            raise ValueError(
+                f"Unsupported cond_type: {active_cond_type!r}"
+            )
 
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1)
@@ -434,29 +469,6 @@ class EDMPrecond(torch.nn.Module):
 
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
-    
-    @torch.no_grad()
-    def sample(self, cond, batch_seeds=None,cond_type=None):
-        # print(batch_seeds)
-        if cond is not None:
-            batch_size, device = cond.shape[0], cond.device
-            if batch_seeds is None:
-                batch_seeds = torch.arange(batch_size)
-        else:
-            device = batch_seeds.device
-            batch_size = batch_seeds.shape[0]
-
-        rnd = StackedRandomGenerator(device, batch_seeds)
-        latents = rnd.randn([batch_size, self.n_latents, self.channels], device=device)
-
-        return edm_sampler(
-            self,
-            latents,
-            cond,
-            cond_type,
-            randn_like=rnd.randn_like,
-            num_steps=self.sample_steps,
-        )
 
 
 def kl_d512_m512_l8_edm(configs=None):
