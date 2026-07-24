@@ -1,0 +1,27 @@
+# Shared AutoencoderKL architecture for reconstruction and latent DDPM.
+klvae:
+  _target_: generative_models_lightning.backbones.vae.AutoencoderKL
+  in_channels: 1
+  out_channels: 1
+  down_block_types:
+    - DownEncoderBlock2D
+    - DownEncoderBlock2D
+    - DownEncoderBlock2D
+  up_block_types:
+    - UpDecoderBlock2D
+    - UpDecoderBlock2D
+    - UpDecoderBlock2D
+  block_out_channels: [64, 128, 256]
+  layers_per_block: 2
+  act_fn: silu
+  latent_channels: 4
+  norm_num_groups: 32
+  sample_size: 64
+  scaling_factor: 0.18215
+  shift_factor: null
+  latents_mean: null
+  latents_std: null
+  force_upcast: true
+  use_quant_conv: true
+  use_post_quant_conv: true
+  mid_block_add_attention: true

@@ -1,0 +1,26 @@
+numTxChan: 12
+numRxChan: 16
+numChirpsPerFrame: 16
+numAdcSamples: 256
+
+StartFrequency: 7.6999999488e+10
+Ideltime: 5.0e-6
+F_design: 76.8
+
+range_fftsize: 256
+doppler_fftsize: 16
+ANGLE_fftsize: 128
+ELEVATION_fftsize: 32
+
+Fs: 8000000
+SamplePerChripUp: 256
+Kr: 7.90000010527e+13
+chirpRampTime: 32.0e-6
+adc_start_time: 6.0e-6
+
+angles_DOA_az: [-78.32238026939581, 78.32238026939581]
+angles_DOA_ele: [-72.9733859227232, 72.9733859227232]
+range_max_m: 15.189873215311652
+
+crop_low: 0.05
+crop_high: 0.05

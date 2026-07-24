@@ -9,3 +9,12 @@
 """
 Backbone building blocks for generative models.
 """
+
+from .autoencoder import AutoEncoderBackbone, AutoencoderBackbone
+from .vae import AutoencoderKL
+
+__all__ = [
+    "AutoEncoderBackbone",
+    "AutoencoderBackbone",
+    "AutoencoderKL",
+]

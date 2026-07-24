@@ -1,0 +1,103 @@
+defaults:
+  - klvae_depth_backbone
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/ldm/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false
+
+seed: 42
+
+# The dataset remains in image/depth space. The trained KL-VAE maps a 64x64
+# target to a 4x16x16 latent before DDPM adds noise.
+image_shape: [64, 64]
+latent_shape: [4, 16, 16]
+cond_channels: 1
+
+# DDPM is deliberately unable to start without a separately trained VAE.
+vae_checkpoint_path: ${oc.env:KLVAE_CKPT}
+
+model:
+  _target_: generative_models_lightning.diffusion.gaussian_diffusion_module.GaussianDiffusionModule
+
+  num_timesteps: 1000
+  beta_schedule: cosine
+  mean_type: epsilon
+  var_type: learned_range
+  loss_type: rescaled_mse
+  rescale_timesteps: false
+
+  sample_shape: ${latent_shape}
+  lr: 1.0e-4
+  weight_decay: 0.0
+  freeze_vae: true
+  vae_checkpoint_path: ${vae_checkpoint_path}
+  vae_checkpoint_prefix: "vae."
+  strict_vae_checkpoint: true
+
+  vae: ${klvae}
+
+  denoiser:
+    _target_: generative_models_lightning.backbones.cond_unet.UNetModel
+    image_size:
+      - ${latent_shape.1}
+      - ${latent_shape.2}
+    in_channels: ${latent_shape.0}
+    model_channels: 64
+    # learned_range predicts one noise and one variance tensor.
+    out_channels: 8
+    num_res_blocks: 2
+    attention_resolutions: [2, 4]
+    num_classes: ${cond_channels}
+    dropout: 0.0
+    channel_mult: [1, 2, 4]
+    conv_resample: true
+    dims: 2
+    use_checkpoint: false
+    use_fp16: false
+    num_heads: 1
+    num_head_channels: -1
+    num_heads_upsample: -1
+    use_scale_shift_norm: false
+    resblock_updown: false
+    use_new_attention_order: false
+
+# Same dataset and normalization as the pixel-space DDPM. Channel and spatial
+# adaptation happens inside AutoencoderKL/GaussianDiffusionModule.
+data_module:
+  _target_: data_module.RadarPromptLiDAR.datamodule.RadarPromptLiDARDataModule
+  aligned_root: ${oc.env:RALD_ALIGNED_ROOT,/home/local/Desktop/code/Datasets/processing/aligned}
+  run_names:
+    - ec_courtyard_run0
+    - ec_courtyard_run1
+    - ec_courtyard_run2
+  cond_dir_name: radar
+  target_dir_name: camera
+  spatial_size: ${image_shape}
+  batch_size: 4
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  match_target_to_condition: true
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  accelerator: auto
+  devices: 1
+  strategy: auto
+  precision: 32-true
+  max_epochs: 100
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+  deterministic: false
+  benchmark: true
+  default_root_dir: outputs/ldm
+  enable_checkpointing: true
+  enable_progress_bar: true
+  logger: false

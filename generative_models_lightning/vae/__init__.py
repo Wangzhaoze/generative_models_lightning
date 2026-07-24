@@ -6,6 +6,6 @@
 # @File    : generative_models_lightning/vae/__init__.py
 # @IDE     : vscode
 
-"""
-VAE model implementations.
-"""
+"""Reserved for future VAE task/training modules."""
+
+__all__: list[str] = []
