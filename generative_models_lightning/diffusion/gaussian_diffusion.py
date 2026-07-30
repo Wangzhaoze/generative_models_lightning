@@ -6,27 +6,227 @@
 # @File    : generative_models_lightning/diffusion/gaussian_diffusion.py
 # @IDE     : vscode
 
-"""
-Implementation adapted from:
-https://github.com/openai/guided-diffusion/blob/main/guided_diffusion/gaussian_diffusion.py
+"""Discrete Gaussian diffusion, from schedules to Lightning orchestration.
+
+The numerical process is adapted from OpenAI guided-diffusion. This file is
+intentionally self-contained and ordered by execution flow:
+
+1. Public prediction/loss types, tensor helpers, and beta schedules.
+2. :class:`GaussianDiffusion`, the DDPM/DDIM forward and reverse process.
+3. Timestep spacing and importance samplers.
+4. :class:`GaussianDiffusionModule`, the Lightning-facing training API.
 """
 
-from typing import Any, Mapping, Optional, cast
+from __future__ import annotations
+
+import enum
+import math
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import Any, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch import nn
 
-from beta_schedule import BetaSchedule
-from .utils import (
-    extract_into_tensor, 
-    mean_flat, 
-    normal_kl, 
-    approx_standard_normal_cdf,
-    DiffusionLossType,
-    DiffusionMeanType,
-    DiffusionVarType,
+from .base_diffusion_module import BaseDiffusionModule
+
+# Public types and numerical helpers.
+
+
+class DiffusionMeanType(enum.Enum):
+    """Prediction represented by the denoiser output."""
+
+    PREVIOUS_X = enum.auto()
+    START_X = enum.auto()
+    EPSILON = enum.auto()
+
+
+class DiffusionVarType(enum.Enum):
+    """Variance represented by the denoiser output."""
+
+    LEARNED = enum.auto()
+    FIXED_SMALL = enum.auto()
+    FIXED_LARGE = enum.auto()
+    LEARNED_RANGE = enum.auto()
+
+
+class DiffusionLossType(enum.Enum):
+    """Objective used to train the discrete process."""
+
+    MSE = enum.auto()
+    RESCALED_MSE = enum.auto()
+    KL = enum.auto()
+    RESCALED_KL = enum.auto()
+
+    def is_vb(self) -> bool:
+        return self in {
+            DiffusionLossType.KL,
+            DiffusionLossType.RESCALED_KL,
+        }
+
+
+def extract_into_tensor(
+    values: np.ndarray,
+    timesteps: torch.Tensor,
+    broadcast_shape: Sequence[int],
+) -> torch.Tensor:
+    """Extract one schedule value per batch item and broadcast it."""
+    result = (
+        torch.from_numpy(values)
+        .to(
+            device=timesteps.device,
+        )[timesteps]
+        .float()
     )
-    
+    while result.ndim < len(broadcast_shape):
+        result = result[..., None]
+    return result.expand(broadcast_shape)
+
+
+def mean_flat(tensor: torch.Tensor) -> torch.Tensor:
+    """Average over every dimension except the batch dimension."""
+    return tensor.mean(dim=tuple(range(1, tensor.ndim)))
+
+
+def normal_kl(
+    mean1: torch.Tensor | float,
+    logvar1: torch.Tensor | float,
+    mean2: torch.Tensor | float,
+    logvar2: torch.Tensor | float,
+) -> torch.Tensor:
+    """Compute a broadcasted KL divergence between two Gaussians."""
+    reference = next(
+        (
+            value
+            for value in (mean1, logvar1, mean2, logvar2)
+            if isinstance(value, torch.Tensor)
+        ),
+        None,
+    )
+    if reference is None:
+        raise TypeError("At least one normal_kl argument must be a Tensor")
+    logvar1 = torch.as_tensor(logvar1, device=reference.device)
+    logvar2 = torch.as_tensor(logvar2, device=reference.device)
+    return 0.5 * (
+        -1.0
+        + logvar2
+        - logvar1
+        + torch.exp(logvar1 - logvar2)
+        + ((mean1 - mean2) ** 2) * torch.exp(-logvar2)
+    )
+
+
+def approx_standard_normal_cdf(x: torch.Tensor) -> torch.Tensor:
+    """Fast approximation of the standard normal CDF."""
+    return 0.5 * (
+        1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))
+    )
+
+
+# Beta schedules.
+
+
+class BetaSchedule(ABC):
+    """Array-like base class for a discrete diffusion beta schedule."""
+
+    def __init__(self, num_timesteps: int) -> None:
+        if num_timesteps <= 0:
+            raise ValueError("num_timesteps must be positive")
+        self.num_timesteps = int(num_timesteps)
+        self._betas = self._build().astype(np.float64)
+        if self._betas.shape != (self.num_timesteps,):
+            raise ValueError(
+                f"Beta schedule must have shape ({self.num_timesteps},), "
+                f"got {self._betas.shape}"
+            )
+        if (
+            not np.isfinite(self._betas).all()
+            or (self._betas <= 0).any()
+            or (self._betas > 1).any()
+        ):
+            raise ValueError("Beta values must be finite and in (0, 1]")
+
+    @abstractmethod
+    def _build(self) -> np.ndarray:
+        raise NotImplementedError
+
+    @property
+    def betas(self) -> np.ndarray:
+        return self._betas
+
+    def __array__(
+        self,
+        dtype: np.dtype[Any] | None = None,
+        copy: bool | None = None,
+    ) -> np.ndarray:
+        values = self._betas if dtype is None else self._betas.astype(dtype)
+        return values.copy() if copy else values
+
+    def __len__(self) -> int:
+        return self.num_timesteps
+
+    def __getitem__(self, index: Any) -> Any:
+        return self._betas[index]
+
+    def __iter__(self) -> Iterator[float]:
+        return iter(self._betas)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(" f"num_timesteps={self.num_timesteps})"
+
+
+class LinearBetaSchedule(BetaSchedule):
+    """Linear schedule from Ho et al., scaled from the 1000-step recipe."""
+
+    def _build(self) -> np.ndarray:
+        scale = 1000.0 / self.num_timesteps
+        return np.linspace(
+            scale * 0.0001,
+            scale * 0.02,
+            self.num_timesteps,
+            dtype=np.float64,
+        )
+
+
+class AlphaBarBetaSchedule(BetaSchedule):
+    """Base for schedules defined by a continuous cumulative alpha."""
+
+    def __init__(
+        self,
+        num_timesteps: int,
+        max_beta: float = 0.999,
+    ) -> None:
+        if not 0.0 < max_beta <= 1.0:
+            raise ValueError("max_beta must be in (0, 1]")
+        self.max_beta = float(max_beta)
+        super().__init__(num_timesteps)
+
+    @abstractmethod
+    def alpha_bar(self, t: float) -> float:
+        raise NotImplementedError
+
+    def _build(self) -> np.ndarray:
+        betas = []
+        for index in range(self.num_timesteps):
+            t1 = index / self.num_timesteps
+            t2 = (index + 1) / self.num_timesteps
+            beta = 1.0 - self.alpha_bar(t2) / self.alpha_bar(t1)
+            betas.append(min(beta, self.max_beta))
+        return np.asarray(betas, dtype=np.float64)
+
+
+class CosineBetaSchedule(AlphaBarBetaSchedule):
+    """Cosine alpha-bar schedule from Improved DDPM."""
+
+    def alpha_bar(self, t: float) -> float:
+        return math.cos((t + 0.008) / 1.008 * math.pi / 2.0) ** 2
+
+
+# DDPM and DDIM process.
+
+
 class GaussianDiffusion:
     """
     Utilities for training and sampling diffusion models.
@@ -47,18 +247,22 @@ class GaussianDiffusion:
     def __init__(
         self,
         *,
-        betas: BetaSchedule,
+        betas: BetaSchedule | Sequence[float] | np.ndarray,
         model_mean_type: DiffusionMeanType,
         model_var_type: DiffusionVarType,
         loss_type: DiffusionLossType,
         rescale_timesteps: bool = False,
-    ):
+    ) -> None:
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
 
         betas = np.asarray(betas, dtype=np.float64)
+        if betas.ndim != 1 or betas.size < 2:
+            raise ValueError("betas must be a 1-D sequence with at least 2 steps")
+        if not np.isfinite(betas).all() or (betas <= 0).any() or (betas > 1).any():
+            raise ValueError("betas must be finite and in (0, 1]")
         self.betas = betas
 
         alphas = 1.0 - betas
@@ -93,10 +297,7 @@ class GaussianDiffusion:
         )
 
     @property
-    def num_timesteps(self):
-        assert len(self.betas.shape) == 1, "betas must be 1-D"
-        assert (self.betas > 0).all() and (self.betas <= 1).all()
-
+    def num_timesteps(self) -> int:
         return int(self.betas.shape[0])
 
     def q_mean_variance(self, x_start, t):
@@ -107,9 +308,7 @@ class GaussianDiffusion:
         :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
         :return: A tuple (mean, variance, log_variance), all of x_start's shape.
         """
-        mean = (
-            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-        )
+        mean = extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
         variance = extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
         log_variance = extract_into_tensor(
             self.log_one_minus_alphas_cumprod, t, x_start.shape
@@ -191,28 +390,36 @@ class GaussianDiffusion:
         """
         kwargs = self._normalize_model_kwargs(model_kwargs)
 
-        B, C = x.shape[:2]
-        assert t.shape == (B,)
-        y = cast(Optional[torch.Tensor], kwargs.get("y"))
-        if y is not None:
-            denoiser_output = denoiser(x, self._scale_timesteps(t), y=y)
-        else:
-            denoiser_output = denoiser(x, self._scale_timesteps(t), **kwargs)
-
-        guidance_scale = kwargs.get("s")
-        if y is not None and isinstance(guidance_scale, (int, float)) and guidance_scale > 1.0:
-            model_output_zero = denoiser(
-                x,
-                self._scale_timesteps(t),
-                y=torch.zeros_like(y),
+        batch_size, channels = x.shape[:2]
+        if t.shape != (batch_size,):
+            raise ValueError(
+                f"timesteps must have shape ({batch_size},), got {t.shape}"
             )
-            denoiser_output[:, :3] = model_output_zero[:, :3] + guidance_scale * (
-                denoiser_output[:, :3] - model_output_zero[:, :3]
-            )
+        denoiser_output = denoiser(
+            x,
+            self._scale_timesteps(t),
+            **kwargs,
+        )
 
-        if self.model_var_type in [DiffusionVarType.LEARNED, DiffusionVarType.LEARNED_RANGE]:
-            assert denoiser_output.shape == (B, C * 2, *x.shape[2:])
-            denoiser_output, model_var_values = torch.split(denoiser_output, C, dim=1)
+        if self.model_var_type in {
+            DiffusionVarType.LEARNED,
+            DiffusionVarType.LEARNED_RANGE,
+        }:
+            expected_shape = (
+                batch_size,
+                channels * 2,
+                *x.shape[2:],
+            )
+            if denoiser_output.shape != expected_shape:
+                raise ValueError(
+                    "Learned variance output must have shape "
+                    f"{expected_shape}, got {tuple(denoiser_output.shape)}"
+                )
+            denoiser_output, model_var_values = torch.split(
+                denoiser_output,
+                channels,
+                dim=1,
+            )
             if self.model_var_type == DiffusionVarType.LEARNED:
                 pred_log_variance = model_var_values
                 pred_variance = torch.exp(pred_log_variance)
@@ -246,11 +453,6 @@ class GaussianDiffusion:
                 x = denoised_fn(x)
             if clip_denoised:
                 x = x.clamp(-1, 1)
-                mean = cast(Optional[torch.Tensor], kwargs.get("mean"))
-                std = cast(Optional[torch.Tensor], kwargs.get("std"))
-                if mean is not None and std is not None:
-                    x = (x - x.mean(dim=(2, 3), keepdim=True)) / x.std(dim=(2, 3), keepdim=True)
-                    x = x * std[None, :, None, None] + mean[None, :, None, None]
             return x
 
         if self.model_mean_type == DiffusionMeanType.PREVIOUS_X:
@@ -258,7 +460,10 @@ class GaussianDiffusion:
                 self._predict_xstart_from_xprev(x_t=x, t=t, xprev=denoiser_output)
             )
             pred_mean = denoiser_output
-        elif self.model_mean_type in [DiffusionMeanType.START_X, DiffusionMeanType.EPSILON]:
+        elif self.model_mean_type in {
+            DiffusionMeanType.START_X,
+            DiffusionMeanType.EPSILON,
+        }:
             if self.model_mean_type == DiffusionMeanType.START_X:
                 pred_xstart = process_xstart(denoiser_output)
             else:
@@ -328,7 +533,12 @@ class GaussianDiffusion:
         return new_mean
 
     def condition_score(
-        self, cond_fn, p_mean_var, x, t, model_kwargs: Optional[Mapping[str, Any]] = None
+        self,
+        cond_fn,
+        p_mean_var,
+        x,
+        t,
+        model_kwargs: Optional[Mapping[str, Any]] = None,
     ):
         """
         Compute what the p_mean_variance output would have been, should the
@@ -397,7 +607,9 @@ class GaussianDiffusion:
             out["mean"] = self.condition_mean(
                 cond_fn, out, x, t, model_kwargs=model_kwargs
             )
-        sample = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
+        sample = (
+            out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
+        )
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
     def p_sample_loop(
@@ -471,14 +683,14 @@ class GaussianDiffusion:
         if device is None:
             device = next(denoiser.parameters()).device
         assert isinstance(shape, (tuple, list))
-        kwargs = self._normalize_model_kwargs(model_kwargs)
+        kwargs = {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in self._normalize_model_kwargs(model_kwargs).items()
+        }
         if noise is not None:
-            img = noise
+            img = noise.to(device)
         else:
             img = torch.randn(*shape, device=device)
-        y = cast(Optional[torch.Tensor], kwargs.get("y"))
-        if y is not None:
-            kwargs["y"] = y.to(device)
         indices = list(range(self.num_timesteps))[::-1]
 
         if progress:
@@ -544,7 +756,7 @@ class GaussianDiffusion:
         noise = torch.randn_like(x)
         mean_pred = (
             out["pred_xstart"] * torch.sqrt(alpha_bar_prev)
-            + torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+            + torch.sqrt(1 - alpha_bar_prev - sigma**2) * eps
         )
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
@@ -839,8 +1051,739 @@ class GaussianDiffusion:
     @staticmethod
     def _normalize_model_kwargs(
         model_kwargs: Optional[Mapping[str, Any]],
-    ):
+    ) -> dict[str, Any]:
         if model_kwargs is None:
             return {}
         return dict(model_kwargs)
 
+
+# Timestep spacing and unbiased importance sampling.
+
+
+def space_timesteps(
+    num_timesteps: int,
+    section_counts: str | Sequence[int],
+) -> set[int]:
+    """Select retained timesteps using guided-diffusion spacing rules."""
+    if num_timesteps <= 0:
+        raise ValueError("num_timesteps must be greater than zero")
+
+    if isinstance(section_counts, str):
+        if section_counts.startswith("ddim"):
+            desired_count = int(section_counts.removeprefix("ddim"))
+            if desired_count <= 0:
+                raise ValueError("DDIM step count must be greater than zero")
+            for stride in range(1, num_timesteps + 1):
+                steps = range(0, num_timesteps, stride)
+                if len(steps) == desired_count:
+                    return set(steps)
+            raise ValueError(
+                f"Cannot create exactly {desired_count} steps " f"from {num_timesteps}"
+            )
+        section_counts = [int(value) for value in section_counts.split(",")]
+
+    counts = [int(value) for value in section_counts]
+    if not counts or any(value <= 0 for value in counts):
+        raise ValueError("section_counts must contain positive integers")
+
+    size_per = num_timesteps // len(counts)
+    extra = num_timesteps % len(counts)
+    start_index = 0
+    selected_steps = []
+    for section_index, section_count in enumerate(counts):
+        size = size_per + (1 if section_index < extra else 0)
+        if size < section_count:
+            raise ValueError(
+                f"Cannot divide section of {size} steps into " f"{section_count}"
+            )
+        fractional_stride = (
+            1.0 if section_count == 1 else (size - 1) / (section_count - 1)
+        )
+        current = 0.0
+        for _ in range(section_count):
+            selected_steps.append(start_index + round(current))
+            current += fractional_stride
+        start_index += size
+    return set(selected_steps)
+
+
+class SpacedDiffusion(GaussianDiffusion):
+    """Gaussian process that retains selected steps from a base process."""
+
+    def __init__(
+        self,
+        num_timesteps: int,
+        section_counts: str | Sequence[int],
+        **kwargs: Any,
+    ) -> None:
+        if "betas" not in kwargs:
+            raise ValueError("SpacedDiffusion requires a base beta schedule")
+        if len(kwargs["betas"]) != num_timesteps:
+            raise ValueError("num_timesteps must match the base beta schedule length")
+
+        self.use_timesteps = space_timesteps(
+            num_timesteps,
+            section_counts,
+        )
+        self.timestep_map: list[int] = []
+        self.original_num_steps = num_timesteps
+
+        base_diffusion = GaussianDiffusion(**kwargs)
+        last_alpha_cumprod = 1.0
+        new_betas = []
+        for index, alpha_cumprod in enumerate(base_diffusion.alphas_cumprod):
+            if index in self.use_timesteps:
+                new_betas.append(1 - alpha_cumprod / last_alpha_cumprod)
+                last_alpha_cumprod = alpha_cumprod
+                self.timestep_map.append(index)
+        kwargs["betas"] = np.asarray(new_betas)
+        super().__init__(**kwargs)
+
+    def p_mean_variance(
+        self,
+        denoiser: nn.Module,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        return super().p_mean_variance(
+            self._wrap_model(denoiser),
+            *args,
+            **kwargs,
+        )
+
+    def condition_mean(
+        self,
+        cond_fn: Callable[..., torch.Tensor],
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return super().condition_mean(
+            self._wrap_model(cond_fn),
+            *args,
+            **kwargs,
+        )
+
+    def condition_score(
+        self,
+        cond_fn: Callable[..., torch.Tensor],
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        return super().condition_score(
+            self._wrap_model(cond_fn),
+            *args,
+            **kwargs,
+        )
+
+    def _wrap_model(
+        self,
+        model: Callable[..., torch.Tensor],
+    ) -> _WrappedModel:
+        if isinstance(model, _WrappedModel):
+            return model
+        return _WrappedModel(
+            model=model,
+            timestep_map=self.timestep_map,
+            rescale_timesteps=self.rescale_timesteps,
+            original_num_steps=self.original_num_steps,
+        )
+
+    def _scale_timesteps(self, t: torch.Tensor) -> torch.Tensor:
+        return t
+
+
+class _WrappedModel:
+    """Map reduced process indices back to original network timesteps."""
+
+    def __init__(
+        self,
+        model: Callable[..., torch.Tensor],
+        timestep_map: Sequence[int],
+        rescale_timesteps: bool,
+        original_num_steps: int,
+    ) -> None:
+        self.model = model
+        self.timestep_map = tuple(timestep_map)
+        self.rescale_timesteps = rescale_timesteps
+        self.original_num_steps = original_num_steps
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        mapping = torch.tensor(
+            self.timestep_map,
+            device=timesteps.device,
+            dtype=timesteps.dtype,
+        )
+        mapped_timesteps = mapping[timesteps]
+        if self.rescale_timesteps:
+            mapped_timesteps = mapped_timesteps.float() * (
+                1000.0 / self.original_num_steps
+            )
+        return self.model(x, mapped_timesteps, **kwargs)
+
+
+class ScheduleSampler(ABC):
+    """Importance-sample discrete training timesteps."""
+
+    def __init__(self, diffusion: GaussianDiffusion) -> None:
+        self.diffusion = diffusion
+
+    @abstractmethod
+    def weights(self) -> np.ndarray:
+        raise NotImplementedError
+
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        weights = np.asarray(self.weights(), dtype=np.float64)
+        if (
+            weights.shape != (self.diffusion.num_timesteps,)
+            or not np.isfinite(weights).all()
+            or (weights <= 0).any()
+        ):
+            raise ValueError(
+                "Schedule sampler weights must be finite, positive, and "
+                "match the number of diffusion timesteps"
+            )
+
+        probabilities = torch.as_tensor(
+            weights / weights.sum(),
+            device=device,
+            dtype=torch.float64,
+        )
+        timesteps = torch.multinomial(
+            probabilities,
+            batch_size,
+            replacement=True,
+            generator=generator,
+        )
+        importance = 1.0 / (len(probabilities) * probabilities[timesteps])
+        return timesteps.long(), importance.float()
+
+
+class UniformSampler(ScheduleSampler):
+    """Sample every diffusion timestep with equal probability."""
+
+    def __init__(self, diffusion: GaussianDiffusion) -> None:
+        super().__init__(diffusion)
+        self._weights = np.ones(
+            diffusion.num_timesteps,
+            dtype=np.float64,
+        )
+
+    def weights(self) -> np.ndarray:
+        return self._weights
+
+
+class LossAwareSampler(ScheduleSampler):
+    """Synchronize adaptive timestep weights across distributed ranks."""
+
+    def update_with_local_losses(
+        self,
+        local_timesteps: torch.Tensor,
+        local_losses: torch.Tensor,
+    ) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            self.update_with_all_losses(
+                local_timesteps.detach().cpu().tolist(),
+                local_losses.detach().cpu().tolist(),
+            )
+            return
+
+        world_size = dist.get_world_size()
+        local_size = torch.tensor(
+            [len(local_timesteps)],
+            dtype=torch.int64,
+            device=local_timesteps.device,
+        )
+        gathered_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+        dist.all_gather(gathered_sizes, local_size)
+        batch_sizes = [int(value.item()) for value in gathered_sizes]
+        max_batch_size = max(batch_sizes)
+
+        padded_timesteps = torch.zeros(
+            max_batch_size,
+            dtype=local_timesteps.dtype,
+            device=local_timesteps.device,
+        )
+        padded_losses = torch.zeros(
+            max_batch_size,
+            dtype=local_losses.dtype,
+            device=local_losses.device,
+        )
+        padded_timesteps[: len(local_timesteps)] = local_timesteps
+        padded_losses[: len(local_losses)] = local_losses
+        timestep_batches = [
+            torch.zeros_like(padded_timesteps) for _ in range(world_size)
+        ]
+        loss_batches = [torch.zeros_like(padded_losses) for _ in range(world_size)]
+        dist.all_gather(timestep_batches, padded_timesteps)
+        dist.all_gather(loss_batches, padded_losses)
+
+        all_timesteps = [
+            int(value.item())
+            for values, size in zip(timestep_batches, batch_sizes)
+            for value in values[:size]
+        ]
+        all_losses = [
+            float(value.item())
+            for values, size in zip(loss_batches, batch_sizes)
+            for value in values[:size]
+        ]
+        self.update_with_all_losses(all_timesteps, all_losses)
+
+    @abstractmethod
+    def update_with_all_losses(
+        self,
+        timesteps: Sequence[int],
+        losses: Sequence[float],
+    ) -> None:
+        raise NotImplementedError
+
+
+class LossSecondMomentResampler(LossAwareSampler):
+    """Sample in proportion to each timestep's recent RMS loss."""
+
+    def __init__(
+        self,
+        diffusion: GaussianDiffusion,
+        history_per_term: int = 10,
+        uniform_prob: float = 0.001,
+    ) -> None:
+        super().__init__(diffusion)
+        if history_per_term <= 0:
+            raise ValueError("history_per_term must be greater than zero")
+        if not 0.0 <= uniform_prob <= 1.0:
+            raise ValueError("uniform_prob must be in [0, 1]")
+        self.history_per_term = int(history_per_term)
+        self.uniform_prob = float(uniform_prob)
+        self._loss_history = np.zeros(
+            (diffusion.num_timesteps, history_per_term),
+            dtype=np.float64,
+        )
+        self._loss_counts = np.zeros(
+            diffusion.num_timesteps,
+            dtype=np.int64,
+        )
+
+    def weights(self) -> np.ndarray:
+        if not self._warmed_up():
+            return np.ones(
+                self.diffusion.num_timesteps,
+                dtype=np.float64,
+            )
+        weights = np.sqrt(np.mean(np.square(self._loss_history), axis=-1))
+        weights /= weights.sum()
+        weights *= 1.0 - self.uniform_prob
+        weights += self.uniform_prob / len(weights)
+        return weights
+
+    def update_with_all_losses(
+        self,
+        timesteps: Sequence[int],
+        losses: Sequence[float],
+    ) -> None:
+        if len(timesteps) != len(losses):
+            raise ValueError("timesteps and losses must have equal length")
+        for timestep, loss in zip(timesteps, losses):
+            if not 0 <= timestep < self.diffusion.num_timesteps:
+                raise ValueError(f"Invalid diffusion timestep {timestep}")
+            if self._loss_counts[timestep] == self.history_per_term:
+                self._loss_history[timestep, :-1] = self._loss_history[timestep, 1:]
+                self._loss_history[timestep, -1] = loss
+            else:
+                index = self._loss_counts[timestep]
+                self._loss_history[timestep, index] = loss
+                self._loss_counts[timestep] += 1
+
+    def _warmed_up(self) -> bool:
+        return bool((self._loss_counts == self.history_per_term).all())
+
+
+def create_named_schedule_sampler(
+    name: str,
+    diffusion: GaussianDiffusion,
+) -> ScheduleSampler:
+    """Construct a built-in Gaussian timestep sampler by name."""
+    normalized_name = name.strip().lower()
+    if normalized_name == "uniform":
+        return UniformSampler(diffusion)
+    if normalized_name == "loss-second-moment":
+        return LossSecondMomentResampler(diffusion)
+    raise ValueError(f"Unknown schedule sampler: {name!r}")
+
+
+# Lightning orchestration.
+
+
+class GaussianDiffusionModule(BaseDiffusionModule):
+    """Train and sample a denoiser with a discrete DDPM/DDIM process."""
+
+    def __init__(
+        self,
+        denoiser: nn.Module,
+        diffusion_process: GaussianDiffusion | None = None,
+        *,
+        scheduler: GaussianDiffusion | None = None,
+        mean_type: DiffusionMeanType | str | None = None,
+        var_type: DiffusionVarType | str | None = None,
+        loss_type: DiffusionLossType | str | None = None,
+        num_timesteps: int = 1000,
+        beta_schedule: str | BetaSchedule = "cosine",
+        schedule_sampler: str | ScheduleSampler = "uniform",
+        rescale_timesteps: bool = False,
+        sampling_method: str = "ddpm",
+        condition_key: str = "y",
+        sample_shape: Sequence[int] | None = None,
+        lr: float = 1e-4,
+        weight_decay: float = 0.01,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            sample_shape=sample_shape,
+            lr=lr,
+            weight_decay=weight_decay,
+            **kwargs,
+        )
+        if diffusion_process is not None and scheduler is not None:
+            raise ValueError("Provide only one of diffusion_process or scheduler")
+        if not condition_key:
+            raise ValueError("condition_key must not be empty")
+        normalized_sampling_method = sampling_method.strip().lower()
+        if normalized_sampling_method not in {"ddpm", "ddim"}:
+            raise ValueError("sampling_method must be 'ddpm' or 'ddim'")
+        diffusion_process = diffusion_process or scheduler
+
+        resolved_mean = self._resolve_enum(
+            mean_type,
+            DiffusionMeanType,
+            default=(
+                diffusion_process.model_mean_type
+                if diffusion_process is not None
+                else DiffusionMeanType.EPSILON
+            ),
+        )
+        resolved_var = self._resolve_enum(
+            var_type,
+            DiffusionVarType,
+            default=(
+                diffusion_process.model_var_type
+                if diffusion_process is not None
+                else DiffusionVarType.FIXED_SMALL
+            ),
+        )
+        resolved_loss = self._resolve_enum(
+            loss_type,
+            DiffusionLossType,
+            default=(
+                diffusion_process.loss_type
+                if diffusion_process is not None
+                else DiffusionLossType.MSE
+            ),
+        )
+
+        if diffusion_process is None:
+            schedule = self._resolve_beta_schedule(
+                beta_schedule,
+                num_timesteps=num_timesteps,
+            )
+            diffusion_process = GaussianDiffusion(
+                betas=schedule,
+                model_mean_type=resolved_mean,
+                model_var_type=resolved_var,
+                loss_type=resolved_loss,
+                rescale_timesteps=rescale_timesteps,
+            )
+        else:
+            process_types = (
+                diffusion_process.model_mean_type,
+                diffusion_process.model_var_type,
+                diffusion_process.loss_type,
+            )
+            requested_types = (
+                resolved_mean,
+                resolved_var,
+                resolved_loss,
+            )
+            if process_types != requested_types:
+                raise ValueError(
+                    "diffusion_process settings do not match module settings: "
+                    f"process={process_types}, module={requested_types}"
+                )
+
+        if isinstance(schedule_sampler, str):
+            resolved_sampler = create_named_schedule_sampler(
+                schedule_sampler,
+                diffusion_process,
+            )
+        elif isinstance(schedule_sampler, ScheduleSampler):
+            if (
+                schedule_sampler.diffusion.num_timesteps
+                != diffusion_process.num_timesteps
+            ):
+                raise ValueError(
+                    "schedule_sampler and diffusion_process must have "
+                    "the same number of timesteps"
+                )
+            resolved_sampler = schedule_sampler
+        else:
+            raise TypeError("schedule_sampler must be a name or ScheduleSampler")
+
+        self.denoiser = denoiser
+        self.diffusion_process = diffusion_process
+        self.schedule_sampler = resolved_sampler
+        self.sampling_method = normalized_sampling_method
+        self.condition_key = condition_key
+        self.mean_type = resolved_mean
+        self.var_type = resolved_var
+        self.loss_type = resolved_loss
+
+        # Kept as a read-only compatibility name for older configurations.
+        self.scheduler = diffusion_process
+        self.save_hyperparameters(
+            ignore=(
+                "denoiser",
+                "diffusion_process",
+                "scheduler",
+                "schedule_sampler",
+            )
+        )
+
+    @staticmethod
+    def _resolve_enum(
+        value: Any,
+        enum_type: type[enum.Enum],
+        *,
+        default: enum.Enum,
+    ) -> enum.Enum:
+        if value is None:
+            return default
+        if isinstance(value, enum_type):
+            return value
+        if isinstance(value, str):
+            key = value.strip().upper()
+            try:
+                return enum_type[key]
+            except KeyError as error:
+                choices = ", ".join(item.name.lower() for item in enum_type)
+                raise ValueError(
+                    f"Unknown {enum_type.__name__} {value!r}; " f"choose {choices}"
+                ) from error
+        raise TypeError(f"{enum_type.__name__} must be a string or enum value")
+
+    @staticmethod
+    def _resolve_beta_schedule(
+        schedule: str | BetaSchedule,
+        *,
+        num_timesteps: int,
+    ) -> BetaSchedule:
+        if isinstance(schedule, BetaSchedule):
+            if len(schedule) != num_timesteps:
+                raise ValueError("beta_schedule length must match num_timesteps")
+            return schedule
+        if not isinstance(schedule, str):
+            raise TypeError("beta_schedule must be a name or BetaSchedule")
+
+        name = schedule.strip().lower()
+        if name == "linear":
+            return LinearBetaSchedule(num_timesteps)
+        if name == "cosine":
+            return CosineBetaSchedule(num_timesteps)
+        raise ValueError("beta_schedule must be 'linear' or 'cosine'")
+
+    def _condition_to_kwargs(
+        self,
+        cond: Any | None,
+    ) -> dict[str, Any]:
+        if cond is None:
+            return {}
+        if isinstance(cond, torch.Tensor):
+            return {self.condition_key: cond}
+        if isinstance(cond, Mapping):
+            return dict(cond)
+        raise TypeError("Gaussian condition must be a Tensor, mapping, or None")
+
+    def compute_loss_terms(
+        self,
+        x: torch.Tensor,
+        cond: Any | None,
+    ) -> dict[str, torch.Tensor]:
+        """Sample timesteps and compute unbiased Gaussian loss terms."""
+        timesteps, importance = self.schedule_sampler.sample(
+            batch_size=x.shape[0],
+            device=x.device,
+        )
+        terms = self._compute_losses(
+            x_start=x,
+            timesteps=timesteps,
+            model_kwargs=self._condition_to_kwargs(cond),
+        )
+        if isinstance(self.schedule_sampler, LossAwareSampler):
+            self.schedule_sampler.update_with_local_losses(
+                timesteps,
+                terms["loss"].detach(),
+            )
+        terms["loss"] = terms["loss"] * importance
+        return terms
+
+    @torch.inference_mode()
+    def sample(
+        self,
+        shape: Sequence[int],
+        cond: Any | None = None,
+        *,
+        sampling_method: str | None = None,
+        progress: bool = False,
+        eta: float = 0.0,
+        **model_kwargs: Any,
+    ) -> torch.Tensor:
+        """Run DDPM or DDIM with condition kwargs passed to the backbone."""
+        resolved_shape = tuple(int(value) for value in shape)
+        if any(value <= 0 for value in resolved_shape):
+            raise ValueError("All sample shape dimensions must be positive")
+        if isinstance(cond, torch.Tensor) and cond.shape[0] != resolved_shape[0]:
+            raise ValueError("Condition batch size must match sample shape")
+        kwargs = {
+            **self._condition_to_kwargs(cond),
+            **model_kwargs,
+        }
+        method = (
+            self.sampling_method
+            if sampling_method is None
+            else sampling_method.strip().lower()
+        )
+        if method == "ddpm":
+            return self.diffusion_process.p_sample_loop(
+                self.denoiser,
+                resolved_shape,
+                device=self.device,
+                model_kwargs=kwargs,
+                progress=progress,
+            )
+        if method == "ddim":
+            return self.diffusion_process.ddim_sample_loop(
+                self.denoiser,
+                resolved_shape,
+                device=self.device,
+                model_kwargs=kwargs,
+                progress=progress,
+                eta=eta,
+            )
+        raise ValueError("sampling_method must be 'ddpm' or 'ddim'")
+
+    def _compute_losses(
+        self,
+        x_start: torch.Tensor,
+        timesteps: torch.Tensor,
+        model_kwargs: Mapping[str, Any] | None = None,
+        noise: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        kwargs = self.diffusion_process._normalize_model_kwargs(model_kwargs)
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        x_t = self.diffusion_process.q_sample(
+            x_start,
+            timesteps,
+            noise=noise,
+        )
+        terms: dict[str, torch.Tensor] = {}
+
+        if self.loss_type in {
+            DiffusionLossType.KL,
+            DiffusionLossType.RESCALED_KL,
+        }:
+            terms["loss"] = self.diffusion_process._vb_terms_bpd(
+                denoiser=self.denoiser,
+                x_start=x_start,
+                x_t=x_t,
+                t=timesteps,
+                clip_denoised=False,
+                model_kwargs=kwargs,
+            )["output"]
+            if self.loss_type == DiffusionLossType.RESCALED_KL:
+                terms["loss"] *= self.diffusion_process.num_timesteps
+            return terms
+
+        if self.loss_type not in {
+            DiffusionLossType.MSE,
+            DiffusionLossType.RESCALED_MSE,
+        }:
+            raise NotImplementedError(self.loss_type)
+
+        model_output = self.denoiser(
+            x_t,
+            self.diffusion_process._scale_timesteps(timesteps),
+            **kwargs,
+        )
+        if self.var_type in {
+            DiffusionVarType.LEARNED,
+            DiffusionVarType.LEARNED_RANGE,
+        }:
+            batch_size, channels = x_t.shape[:2]
+            expected_shape = (
+                batch_size,
+                channels * 2,
+                *x_t.shape[2:],
+            )
+            if model_output.shape != expected_shape:
+                raise ValueError(
+                    "Learned variance output must have shape " f"{expected_shape}"
+                )
+            model_output, model_var_values = torch.split(
+                model_output,
+                channels,
+                dim=1,
+            )
+            frozen_output = torch.cat(
+                [model_output.detach(), model_var_values],
+                dim=1,
+            )
+
+            def frozen_denoiser(
+                *args: Any,
+                **unused: Any,
+            ) -> torch.Tensor:
+                del args, unused
+                return frozen_output
+
+            terms["vb"] = self.diffusion_process._vb_terms_bpd(
+                denoiser=frozen_denoiser,
+                x_start=x_start,
+                x_t=x_t,
+                t=timesteps,
+                clip_denoised=False,
+            )["output"]
+            if self.loss_type == DiffusionLossType.RESCALED_MSE:
+                terms["vb"] *= self.diffusion_process.num_timesteps / 1000.0
+
+        if self.mean_type == DiffusionMeanType.PREVIOUS_X:
+            target = self.diffusion_process.q_posterior_mean_variance(
+                x_start=x_start,
+                x_t=x_t,
+                t=timesteps,
+            )[0]
+        elif self.mean_type == DiffusionMeanType.START_X:
+            target = x_start
+        elif self.mean_type == DiffusionMeanType.EPSILON:
+            target = noise
+        else:
+            raise NotImplementedError(self.mean_type)
+        if model_output.shape != target.shape:
+            raise ValueError(
+                "Denoiser output and Gaussian target shapes differ: "
+                f"{tuple(model_output.shape)} != {tuple(target.shape)}"
+            )
+
+        terms["mse"] = mean_flat((target - model_output) ** 2)
+        terms["loss"] = terms["mse"] + terms["vb"] if "vb" in terms else terms["mse"]
+        return terms

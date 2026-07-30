@@ -6,214 +6,155 @@
 # @File    : generative_models_lightning/diffusion/base_diffusion_module.py
 # @IDE     : vscode
 
-"""
-Diffusion model implementations.
-"""
+"""Algorithm-agnostic Lightning scaffolding for diffusion models."""
+
+from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, cast, Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import torch
 
-from generative_models_lightning import BaseGenerativeModule, Batch
-import torch.nn as nn
+from generative_models_lightning import BaseGenerativeModule
 
-from .gaussian_diffusion import GaussianDiffusion, mean_flat, DiffusionLossType, DiffusionMeanType, DiffusionVarType
 
-class BaseDiffusionLitModule(BaseGenerativeModule):
-    """
-    Shared LightningModule scaffolding for diffusion models.
-
-    Diffusion modules own batch interpretation and optimization-time orchestration.
-    The underlying diffusion process stays responsible for process-specific
-    forward/reverse diffusion math and sampling routines.
-    """
+class BaseDiffusionModule(BaseGenerativeModule, ABC):
+    """Share Lightning orchestration without coupling diffusion mathematics."""
 
     def __init__(
         self,
-        denoiser: nn.Module,
-        scheduler: GaussianDiffusion,
-        mean_type: DiffusionMeanType,
-        var_type: DiffusionVarType,
-        loss_type: DiffusionLossType,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.scheduler = scheduler
-        self.denoiser = denoiser
-        self.mean_type = mean_type
-        self.var_type = var_type
-        self.loss_type = loss_type
-
-    def training_step(self, batch: Batch, batch_idx: int):
-        t=torch.randint(
-            low=0, 
-            high=self.scheduler.num_timesteps, 
-            size=(batch["x"].shape[0],), 
-            device=batch["x"].device
-            )
-        losses = self._compute_losses(
-            x_start=batch["x"],
-            t=t,
-            model_kwargs={"y": batch["cond"]} if batch.get("cond") is not None else None,
+        sample_shape: Sequence[int] | None = None,
+        lr: float = 1e-4,
+        weight_decay: float = 0.01,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(lr=lr, weight_decay=weight_decay, **kwargs)
+        self.sample_shape = (
+            tuple(int(value) for value in sample_shape)
+            if sample_shape is not None
+            else None
         )
+        if self.sample_shape is not None and any(
+            value <= 0 for value in self.sample_shape
+        ):
+            raise ValueError("sample_shape dimensions must be greater than zero")
 
-        # Extract main loss
-        if isinstance(losses, dict) and "loss" in losses:
-            loss = losses["loss"].mean()
+    @staticmethod
+    def _unpack_batch(batch: Any) -> tuple[torch.Tensor, Any | None]:
+        """Normalize supported batch forms to ``(target, condition)``."""
+        if isinstance(batch, Mapping):
+            if "x" not in batch:
+                raise KeyError("Diffusion batch mapping must contain key 'x'")
+            x = batch["x"]
+            cond = batch.get("cond")
+        elif isinstance(batch, (tuple, list)) and len(batch) == 2:
+            x, cond = batch
+        elif isinstance(batch, torch.Tensor):
+            x, cond = batch, None
         else:
-            raise ValueError("Expected 'loss' key in losses dict.")
-        # Log loss
-        self.log("val/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        
-        # Log other loss components (if any)
-        if isinstance(losses, dict):
-            for k, v in losses.items():
-                if k == "loss":
-                    continue
-                try:
-                    val = v.mean()
-                    self.log(f"val/{k}", val, on_step=True, on_epoch=True, sync_dist=True)
-                except Exception:
-                    pass
-        
-        return loss
-    
-    def validation_step(self, batch: Batch, batch_idx: int):
-        t=torch.randint(
-            low=0, 
-            high=self.scheduler.num_timesteps, 
-            size=(batch["x"].shape[0],), 
-            device=batch["x"].device
+            raise TypeError("Batch must be a tensor, a mapping, or an (x, cond) pair")
+
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"Batch input x must be a Tensor, got {type(x).__name__}")
+        return x, cond
+
+    def _shared_step(self, batch: Any, stage: str) -> torch.Tensor:
+        x, cond = self._unpack_batch(batch)
+        loss_terms = self.compute_loss_terms(x=x, cond=cond)
+        if "loss" not in loss_terms:
+            raise ValueError(
+                "compute_loss_terms() must return a dictionary with key 'loss'"
             )
-        losses = self._compute_losses(
-            x_start=batch["x"],
-            t=t,
-            model_kwargs={"y": batch["cond"]} if batch.get("cond") is not None else None,
-        )
 
-        # Extract main loss
-        if isinstance(losses, dict) and "loss" in losses:
-            loss = losses["loss"].mean()
-        else:
-            raise ValueError("Expected 'loss' key in losses dict.")
-        # Log loss
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        
-        # Log other loss components (if any)
-        if isinstance(losses, dict):
-            for k, v in losses.items():
-                if k == "loss":
-                    continue
-                try:
-                    val = v.mean()
-                    self.log(f"train/{k}", val, on_step=True, on_epoch=True, sync_dist=True)
-                except Exception:
-                    pass
-        
+        loss = loss_terms["loss"].mean()
+        self.log(
+            f"{stage}/loss",
+            loss,
+            prog_bar=True,
+            on_step=stage == "train",
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=x.shape[0],
+        )
+        for name, value in loss_terms.items():
+            if name == "loss":
+                continue
+            self.log(
+                f"{stage}/{name}",
+                value.mean(),
+                on_step=stage == "train",
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=x.shape[0],
+            )
         return loss
 
-    
-    def generate(self, batch: Batch, *args, **kwargs):
-        with torch.no_grad():
-            generated = self.scheduler.p_sample_loop(
-                self.denoiser,
-                batch["x"],
-                device=self.device,
-                model_kwargs=kwargs
-            )
-        return generated
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        del batch_idx
+        return self._shared_step(batch, stage="train")
 
+    def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        del batch_idx
+        return self._shared_step(batch, stage="val")
 
-    def _compute_losses(
+    def predict_step(
         self,
-        x_start,
-        t,
-        model_kwargs: Optional[Mapping[str, Any]] = None,
-        noise=None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute training losses for a single timestep.
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> torch.Tensor:
+        del batch_idx, dataloader_idx
+        return self.generate(batch=batch)
 
-        :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :param t: a batch of timestep indices.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param noise: if specified, the specific Gaussian noise to try to remove.
-        :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
-        """
-        kwargs = self.scheduler._normalize_model_kwargs(model_kwargs)
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        x_t = self.scheduler.q_sample(x_start, t, noise=noise)
+    @abstractmethod
+    def compute_loss_terms(
+        self,
+        x: torch.Tensor,
+        cond: Any | None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute one or more per-sample algorithm-specific loss terms."""
+        raise NotImplementedError
 
-        terms = {}
+    @torch.inference_mode()
+    @abstractmethod
+    def sample(
+        self,
+        shape: Sequence[int],
+        cond: Any | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Generate samples using an algorithm-specific reverse process."""
+        raise NotImplementedError
 
-        if self.loss_type == DiffusionLossType.KL or self.loss_type == DiffusionLossType.RESCALED_KL:
-            terms["loss"] = self.scheduler._vb_terms_bpd(
-                denoiser=self.denoiser,
-                x_start=x_start,
-                x_t=x_t,
-                t=t,
-                clip_denoised=False,
-                model_kwargs=kwargs,
-            )["output"]
-            if self.loss_type == DiffusionLossType.RESCALED_KL:
-                terms["loss"] *= self.scheduler.num_timesteps
-        elif self.loss_type == DiffusionLossType.MSE or self.loss_type == DiffusionLossType.RESCALED_MSE:
-            y = cast(Optional[torch.Tensor], kwargs.get("y"))
-            if y is not None:
-                model_output = self.denoiser(
-                    x_t,
-                    self.scheduler._scale_timesteps(t),
-                    y=y,
-                )
+    @torch.inference_mode()
+    def generate(
+        self,
+        batch: Any | None = None,
+        *,
+        batch_size: int | None = None,
+        shape: Sequence[int] | None = None,
+        cond: Any | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Generate from an input batch, an explicit shape, or ``sample_shape``."""
+        batch_x = None
+        batch_cond = None
+        if batch is not None:
+            batch_x, batch_cond = self._unpack_batch(batch)
+        if cond is None:
+            cond = batch_cond
+
+        if shape is None:
+            if batch_x is not None:
+                shape = tuple(batch_x.shape)
+            elif self.sample_shape is not None:
+                shape = (int(batch_size or 1), *self.sample_shape)
             else:
-                model_output = self.denoiser(
-                    x_t,
-                    self.scheduler._scale_timesteps(t),
-                    **kwargs,
-                )
+                raise ValueError("Provide batch, shape, or configure sample_shape")
 
-            if self.var_type in [
-                DiffusionVarType.LEARNED,
-                DiffusionVarType.LEARNED_RANGE,
-            ]:
-                B, C = x_t.shape[:2]
-                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
-                model_output, model_var_values = torch.split(model_output, C, dim=1)
-                # Learn the variance using the variational bound, but don't let
-                # it affect our mean prediction.
-                frozen_out = torch.cat([model_output.detach(), model_var_values], dim=1)
-                terms["vb"] = self.scheduler._vb_terms_bpd(
-                    denoiser=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
-                    x_t=x_t,
-                    t=t,
-                    clip_denoised=False,
-                )["output"]
-                if self.loss_type == DiffusionLossType.RESCALED_MSE:
-                    # Divide by 1000 for equivalence with initial implementation.
-                    # Without a factor of 1/1000, the VB term hurts the MSE term.
-                    terms["vb"] *= self.scheduler.num_timesteps / 1000.0
-
-            target = {
-                DiffusionMeanType.PREVIOUS_X: self.scheduler.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
-                )[0],
-                DiffusionMeanType.START_X: x_start,
-                DiffusionMeanType.EPSILON: noise,
-            }[self.mean_type]
-            
-            assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
-            if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
-            else:
-                terms["loss"] = terms["mse"]
-        else:
-            raise NotImplementedError(self.loss_type)
-
-        return terms
+        return self.sample(
+            shape=tuple(int(value) for value in shape),
+            cond=cond,
+            **kwargs,
+        )
