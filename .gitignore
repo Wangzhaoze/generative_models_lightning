@@ -10,6 +10,11 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+outputs/
+data/
+.tmp_edm_smoke/
+lightning_logs/
+tb_logs/
 
 # Virtual environments
 .venv/

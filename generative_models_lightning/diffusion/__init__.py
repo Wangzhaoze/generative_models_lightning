@@ -1,37 +1,58 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# @Time    : 2026-05-09
-# @Author  : Zhaoze Wang
-# @Site    : https://github.com/Wangzhaoze/generative_models_lightning
-# @File    : /generative_models_lightning/diffusion/scheduler/__init__.py
-# @IDE     : vscode
+"""Parallel diffusion implementations sharing one Lightning base."""
 
+from .base_diffusion_module import BaseDiffusionModule
+from .edm import EDMDiffusionModule, EDMLoss, EDMPreconditioner, edm_sampler
+from .gaussian_diffusion import (
+    AlphaBarBetaSchedule,
+    BetaSchedule,
+    CosineBetaSchedule,
+    DiffusionLossType,
+    DiffusionMeanType,
+    DiffusionVarType,
+    GaussianDiffusion,
+    GaussianDiffusionModule,
+    LinearBetaSchedule,
+    LossAwareSampler,
+    LossSecondMomentResampler,
+    ScheduleSampler,
+    SpacedDiffusion,
+    UniformSampler,
+    approx_standard_normal_cdf,
+    create_named_schedule_sampler,
+    extract_into_tensor,
+    mean_flat,
+    normal_kl,
+    space_timesteps,
+)
 
-
-"""
-Describe the purpose of this module.
-"""
-
-"""Diffusion schedulers."""
-
-from .gaussian_diffusion import GaussianDiffusion
-from .spaced_diffusion import SpacedDiffusion, space_timesteps
-from .utils import extract_into_tensor, mean_flat, normal_kl
-from .beta_schedule import get_named_beta_schedule
-from .resample import ScheduleSampler, create_named_schedule_sampler
-from .ddpm import DDPMScheduler
-from .ddim import DDIMScheduler
+# Backwards-compatible package-level name for the old Gaussian-specific class.
+BaseDiffusionLitModule = GaussianDiffusionModule
 
 __all__ = [
+    "AlphaBarBetaSchedule",
+    "BaseDiffusionLitModule",
+    "BaseDiffusionModule",
+    "BetaSchedule",
+    "CosineBetaSchedule",
+    "EDMDiffusionModule",
+    "EDMLoss",
+    "EDMPreconditioner",
+    "DiffusionLossType",
+    "DiffusionMeanType",
+    "DiffusionVarType",
     "GaussianDiffusion",
+    "GaussianDiffusionModule",
+    "LinearBetaSchedule",
+    "LossAwareSampler",
+    "LossSecondMomentResampler",
+    "ScheduleSampler",
     "SpacedDiffusion",
-    "space_timesteps",
+    "UniformSampler",
+    "approx_standard_normal_cdf",
+    "create_named_schedule_sampler",
+    "edm_sampler",
     "extract_into_tensor",
     "mean_flat",
     "normal_kl",
-    "get_named_beta_schedule",
-    "ScheduleSampler",
-    "create_named_schedule_sampler",
-    "DDPMScheduler",
-    "DDIMScheduler",
+    "space_timesteps",
 ]
