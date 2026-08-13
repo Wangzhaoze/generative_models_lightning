@@ -9,11 +9,10 @@ import torch.nn.functional as F
 
 from torch import Tensor
 
-from flow_matching.path.path import ProbPath
-
-from flow_matching.path.path_sample import DiscretePathSample
-from flow_matching.path.scheduler import ConvexScheduler
-from flow_matching.utils import expand_tensor_like, unsqueeze_to_match
+from .path import ProbPath
+from .path_sample import DiscretePathSample
+from .scheduler import ConvexScheduler
+from ..utils import expand_tensor_like, unsqueeze_to_match
 
 
 class MixtureDiscreteProbPath(ProbPath):

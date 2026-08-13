@@ -10,9 +10,9 @@ from typing import Callable
 import torch
 from torch import Tensor
 
-from flow_matching.solver.solver import Solver
-from flow_matching.utils import ModelWrapper
-from flow_matching.utils.manifolds import geodesic, Manifold
+from ..utils import ModelWrapper
+from ..utils.manifolds import Manifold, geodesic
+from .solver import Solver
 
 try:
     from tqdm import tqdm

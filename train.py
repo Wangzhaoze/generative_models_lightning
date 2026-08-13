@@ -20,7 +20,7 @@ from omegaconf import DictConfig
 
 path = os.getcwd()
 
-@hydra.main(config_path='config', config_name='mnist_config.yaml')
+@hydra.main(config_path='configs', config_name='mnist_config.yaml')
 def main(cfg: DictConfig) -> None:
     """
     Main function to execute the training of a segmentation model.

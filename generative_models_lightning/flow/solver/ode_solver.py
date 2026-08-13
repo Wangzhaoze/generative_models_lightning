@@ -8,10 +8,17 @@ from typing import Callable, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor
-from torchdiffeq import odeint
 
-from flow_matching.solver.solver import Solver
-from flow_matching.utils import gradient, ModelWrapper
+try:
+    from torchdiffeq import odeint
+
+    TORCHDIFFEQ_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised in local smoke envs only.
+    odeint = None
+    TORCHDIFFEQ_AVAILABLE = False
+
+from ..utils import ModelWrapper, gradient
+from .solver import Solver
 
 
 class ODESolver(Solver):
@@ -26,6 +33,40 @@ class ODESolver(Solver):
     def __init__(self, velocity_model: Union[ModelWrapper, Callable]):
         super().__init__()
         self.velocity_model = velocity_model
+
+    @staticmethod
+    def _fallback_sample(
+        ode_func: Callable[[Tensor, Tensor], Tensor],
+        x_init: Tensor,
+        time_grid: Tensor,
+        method: str,
+        return_intermediates: bool,
+    ) -> Union[Tensor, Sequence[Tensor]]:
+        if method not in {"euler", "midpoint"}:
+            raise ImportError(
+                "torchdiffeq is not installed; fallback ODE sampling only supports "
+                "'euler' and 'midpoint'."
+            )
+
+        x_t = x_init
+        intermediates = [x_t.clone()] if return_intermediates else None
+        for t_start, t_end in zip(time_grid[:-1], time_grid[1:]):
+            dt = t_end - t_start
+            if method == "euler":
+                x_t = x_t + dt * ode_func(t_start, x_t)
+            else:
+                k1 = ode_func(t_start, x_t)
+                midpoint_time = t_start + 0.5 * dt
+                midpoint_state = x_t + 0.5 * dt * k1
+                k2 = ode_func(midpoint_time, midpoint_state)
+                x_t = x_t + dt * k2
+
+            if intermediates is not None:
+                intermediates.append(x_t.clone())
+
+        if intermediates is not None:
+            return torch.stack(intermediates, dim=0)
+        return x_t
 
     def sample(
         self,
@@ -87,21 +128,30 @@ class ODESolver(Solver):
         ode_opts = {"step_size": step_size} if step_size is not None else {}
 
         with torch.set_grad_enabled(enable_grad):
-            # Approximate ODE solution with numerical ODE solver
-            sol = odeint(
-                ode_func,
-                x_init,
-                time_grid,
-                method=method,
-                options=ode_opts,
-                atol=atol,
-                rtol=rtol,
-            )
+            if TORCHDIFFEQ_AVAILABLE:
+                # Approximate ODE solution with numerical ODE solver
+                sol = odeint(
+                    ode_func,
+                    x_init,
+                    time_grid,
+                    method=method,
+                    options=ode_opts,
+                    atol=atol,
+                    rtol=rtol,
+                )
+            else:
+                sol = self._fallback_sample(
+                    ode_func=ode_func,
+                    x_init=x_init,
+                    time_grid=time_grid,
+                    method=method,
+                    return_intermediates=return_intermediates,
+                )
 
         if return_intermediates:
             return sol
         else:
-            return sol[-1]
+            return sol[-1] if TORCHDIFFEQ_AVAILABLE else sol
 
     def compute_likelihood(
         self,
@@ -138,6 +188,10 @@ class ODESolver(Solver):
         Returns:
             Union[Tuple[Tensor, Tensor], Tuple[Sequence[Tensor], Tensor]]: Samples at time_grid and log likelihood values of given x_1.
         """
+        if not TORCHDIFFEQ_AVAILABLE:
+            raise ImportError(
+                "torchdiffeq is required for ODE likelihood computation."
+            )
         assert (
             time_grid[0] == 1.0 and time_grid[-1] == 0.0
         ), f"Time grid must start at 1.0 and end at 0.0. Got {time_grid}"
