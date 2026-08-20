@@ -1,0 +1,58 @@
+seed: 42
+
+hydra:
+  run:
+    dir: outputs/wgan_gp_cifar10/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false
+
+data_module:
+  _target_: data_module.cifar10.CIFAR10DataModule
+  data_dir: ${oc.env:DATA_DIR,./data}
+  batch_size: 64
+  num_workers: 4
+  val_size: 5000
+  seed: ${seed}
+  download: true
+  pin_memory: true
+  use_fake_data: false
+  fake_train_size: 256
+  fake_val_size: 64
+
+model:
+  _target_: generative_models_lightning.gan.WGANGPModule
+  sample_shape: [3, 32, 32]
+  latent_dim: 128
+  model_dim: 64
+  lr: 1.0e-4
+  lambda_gp: 10.0
+  n_critic: 5
+  weight_decay: 0.0
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  accelerator: auto
+  devices: 1
+  strategy: auto
+  precision: 32-true
+  fast_dev_run: false
+  max_epochs: 100
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  check_val_every_n_epoch: 1
+  default_root_dir: ${hydra:runtime.output_dir}
+  enable_checkpointing: true
+  enable_progress_bar: true
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      dirpath: ${hydra:runtime.output_dir}/checkpoints
+      filename: "wgan-gp-cifar10-{epoch:03d}-{step:08d}"
+      monitor: val/loss_g
+      mode: min
+      save_last: true
+      save_top_k: 3
+      auto_insert_metric_name: false
+  logger:
+    _target_: lightning.pytorch.loggers.TensorBoardLogger
+    save_dir: ${hydra:runtime.output_dir}
+    name: tensorboard
